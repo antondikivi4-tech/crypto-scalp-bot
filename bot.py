@@ -1,8 +1,7 @@
 import os
 import time
-import asyncio
+import requests
 import ccxt
-from telegram import Bot
 
 # --- НАСТРОЙКИ ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  
@@ -13,8 +12,19 @@ TIMEFRAME = "15"
 
 THRESHOLD_PERCENT = 0.2 
 
-bot = Bot(token=TELEGRAM_TOKEN)
 exchange = ccxt.bybit()
+
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Ошибка отправки в Telegram: {e}")
 
 def get_support_resistance(candles):
     highs = [c[2] for c in candles]
@@ -24,9 +34,6 @@ def get_support_resistance(candles):
     support = min(lows[:-1])
     
     return support, resistance
-
-async def send_alert(message):
-    await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
 
 def check_markets():
     print("Проверка рынков через Bybit...")
@@ -39,24 +46,24 @@ def check_markets():
             support_diff = abs(current_price - support) / support * 100
             if support_diff <= THRESHOLD_PERCENT:
                 message = (
-                    f"🟢 **СИГНАЛ: ПОДДЕРЖКА (Bybit)**\n"
+                    f"🟢 *СИГНАЛ: ПОДДЕРЖКА (Bybit)*\n"
                     f"Монета: `{symbol}`\n"
                     f"Таймфрейм: `{TIMEFRAME}m`\n"
                     f"Цена: `{current_price}`\n"
                     f"Уровень поддержки: `{support:.4f}`"
                 )
-                asyncio.run(send_alert(message))
+                send_telegram_message(message)
             
             resistance_diff = abs(current_price - resistance) / resistance * 100
             if resistance_diff <= THRESHOLD_PERCENT:
                 message = (
-                    f"🔴 **СИГНАЛ: СОПРОТИВЛЕНИЕ (Bybit)**\n"
+                    f"🔴 *СИГНАЛ: СОПРОТИВЛЕНИЕ (Bybit)*\n"
                     f"Монета: `{symbol}`\n"
                     f"Таймфрейм: `{TIMEFRAME}m`\n"
                     f"Цена: `{current_price}`\n"
                     f"Уровень сопротивления: `{resistance:.4f}`"
                 )
-                asyncio.run(send_alert(message))
+                send_telegram_message(message)
                 
         except Exception as e:
             print(f"Ошибка при обработке {symbol}: {e}")
