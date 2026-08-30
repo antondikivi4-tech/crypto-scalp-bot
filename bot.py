@@ -10,33 +10,31 @@ import numpy as np
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "673791974")
 
-TIMEFRAME = "15m"               # основной ТФ
+TIMEFRAME = "15m"
 HIGHER_TF_1H = "1h"
 HIGHER_TF_4H = "4h"
 
-THRESHOLD_PERCENT = 0.25        # допуск к уровню (%)
-IMPULSE_PERCENT = 1.3           # мин. импульс свечи
+THRESHOLD_PERCENT = 0.25
+IMPULSE_PERCENT = 1.3
 TOP_COINS_LIMIT = 8
-COOLDOWN_TIME = 2700            # 45 минут
-CACHE_TOP_SECONDS = 300         # кэш топ-монет 5 минут
+COOLDOWN_TIME = 2700
+CACHE_TOP_SECONDS = 300
 MAX_RETRIES = 4
 BACKOFF_BASE = 1.8
 
-# Риск-параметры (для подсказок в сообщениях)
-RISK_PERCENT = 0.8              # % депозита на сделку (подсказка)
+RISK_PERCENT = 0.8
 ATR_SL_MULT = 1.4
 ATR_TP1_MULT = 2.0
 ATR_TP2_MULT = 3.5
 
-# Фильтры
 MIN_VOLUME_SPIKE = 1.7
 MIN_RISING_VOLUME_BARS = 2
 RSI_OVERSOLD = 38
 RSI_OVERBOUGHT = 62
 STOCH_OVERSOLD = 25
 STOCH_OVERBOUGHT = 75
-MAX_BTC_VOLATILITY_ATR = 2.8    # если ATR BTC слишком высокий — фильтруем
-LOW_LIQUIDITY_HOURS_UTC = {0, 1, 2, 3, 4, 5}  # часы низкой ликвидности (UTC)
+MAX_BTC_VOLATILITY_ATR = 2.8
+LOW_LIQUIDITY_HOURS_UTC = {0, 1, 2, 3, 4, 5}
 
 sent_signals = {}
 top_symbols_cache = {"symbols": [], "timestamp": 0}
@@ -86,7 +84,7 @@ def calculate_atr(candles, period=14):
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     if len(trs) < period:
-        return np.mean(trs) if trs else 0.0
+        return float(np.mean(trs)) if trs else 0.0
     return float(np.mean(trs[-period:]))
 
 def calculate_rsi(closes, period=14):
@@ -121,9 +119,9 @@ def calculate_macd(closes, fast=12, slow=26, signal=9):
         ema_slow[i] = closes[i] * alpha_s + ema_slow[i-1] * (1 - alpha_s)
     macd_line = ema_fast - ema_slow
     signal_line = np.zeros_like(macd_line)
-    signal_line[slow+signal-2] = np.mean(macd_line[slow-1:slow+signal-1])
+    signal_line[slow + signal - 2] = np.mean(macd_line[slow-1:slow+signal-1])
     alpha_sig = 2 / (signal + 1)
-    for i in range(slow+signal-1, len(closes)):
+    for i in range(slow + signal - 1, len(closes)):
         signal_line[i] = macd_line[i] * alpha_sig + signal_line[i-1] * (1 - alpha_sig)
     hist = macd_line - signal_line
     return float(macd_line[-1]), float(signal_line[-1]), float(hist[-1])
@@ -135,32 +133,29 @@ def calculate_stochastic(candles, k_period=14, d_period=3):
     lows = [c[3] for c in candles]
     closes = [c[4] for c in candles]
     k_values = []
-    for i in range(k_period-1, len(candles)):
-        highest = max(highs[i-k_period+1:i+1])
-        lowest = min(lows[i-k_period+1:i+1])
+    for i in range(k_period - 1, len(candles)):
+        highest = max(highs[i - k_period + 1:i + 1])
+        lowest = min(lows[i - k_period + 1:i + 1])
         if highest == lowest:
             k = 50.0
         else:
             k = 100 * (closes[i] - lowest) / (highest - lowest)
         k_values.append(k)
     if len(k_values) < d_period:
-        return k_values[-1], k_values[-1]
+        return float(k_values[-1]), float(k_values[-1])
     d = np.mean(k_values[-d_period:])
     return float(k_values[-1]), float(d)
 
 def detect_rsi_divergence(closes, rsi_values, lookback=20):
-    """Простая бычья/медвежья дивергенция RSI"""
     if len(closes) < lookback or len(rsi_values) < lookback:
         return None
     price_slice = closes[-lookback:]
     rsi_slice = rsi_values[-lookback:]
-    # Бычья: цена делает ниже лоу, RSI — выше
     price_low_idx = int(np.argmin(price_slice))
     rsi_low_idx = int(np.argmin(rsi_slice))
     if price_low_idx > lookback // 2 and rsi_low_idx < price_low_idx - 3:
         if price_slice[price_low_idx] < min(price_slice[:price_low_idx]) and rsi_slice[rsi_low_idx] > rsi_slice[price_low_idx]:
             return "bullish"
-    # Медвежья
     price_high_idx = int(np.argmax(price_slice))
     rsi_high_idx = int(np.argmax(rsi_slice))
     if price_high_idx > lookback // 2 and rsi_high_idx < price_high_idx - 3:
@@ -169,44 +164,36 @@ def detect_rsi_divergence(closes, rsi_values, lookback=20):
     return None
 
 def find_fractal_swings(candles, left=2, right=2, min_strength=0.15):
-    """Фрактальные хаи/лоу + минимальная сила (в % от цены)"""
     highs = [c[2] for c in candles]
     lows = [c[3] for c in candles]
     volumes = [c[5] for c in candles]
     swing_highs = []
     swing_lows = []
     for i in range(left, len(candles) - right):
-        # Fractal High
-        if all(highs[i] > highs[i-j] for j in range(1, left+1)) and all(highs[i] > highs[i+j] for j in range(1, right+1)):
-            strength = (highs[i] - min(lows[i-left:i+right+1])) / highs[i] * 100
-            vol_strength = volumes[i] / (np.mean(volumes[max(0, i-10):i+1]) + 1e-9)
+        if all(highs[i] > highs[i - j] for j in range(1, left + 1)) and all(highs[i] > highs[i + j] for j in range(1, right + 1)):
+            strength = (highs[i] - min(lows[i - left:i + right + 1])) / highs[i] * 100
+            vol_strength = volumes[i] / (np.mean(volumes[max(0, i - 10):i + 1]) + 1e-9)
             if strength >= min_strength and vol_strength > 0.8:
-                swing_highs.append({"price": highs[i], "idx": i, "strength": strength, "vol": vol_strength})
-        # Fractal Low
-        if all(lows[i] < lows[i-j] for j in range(1, left+1)) and all(lows[i] < lows[i+j] for j in range(1, right+1)):
-            strength = (max(highs[i-left:i+right+1]) - lows[i]) / lows[i] * 100
-            vol_strength = volumes[i] / (np.mean(volumes[max(0, i-10):i+1]) + 1e-9)
+                swing_highs.append({"price": highs[i], "idx": i, "strength": strength})
+        if all(lows[i] < lows[i - j] for j in range(1, left + 1)) and all(lows[i] < lows[i + j] for j in range(1, right + 1)):
+            strength = (max(highs[i - left:i + right + 1]) - lows[i]) / lows[i] * 100
+            vol_strength = volumes[i] / (np.mean(volumes[max(0, i - 10):i + 1]) + 1e-9)
             if strength >= min_strength and vol_strength > 0.8:
-                swing_lows.append({"price": lows[i], "idx": i, "strength": strength, "vol": vol_strength})
+                swing_lows.append({"price": lows[i], "idx": i, "strength": strength})
     return swing_highs, swing_lows
 
 def get_dynamic_levels(candles, atr, current_price):
-    """Комбинация фракталов + ATR-зоны"""
-    swing_highs, swing_lows = find_fractal_swings(candles, left=2, right=2, min_strength=0.12)
+    swing_highs, swing_lows = find_fractal_swings(candles)
     resistance_candidates = [s["price"] for s in swing_highs[-6:]] if swing_highs else []
     support_candidates = [s["price"] for s in swing_lows[-6:]] if swing_lows else []
 
-    # Добавляем ATR-зоны вокруг последних экстремумов
     if swing_highs:
         last_high = swing_highs[-1]["price"]
-        resistance_candidates.append(last_high + atr * 0.3)
-        resistance_candidates.append(last_high - atr * 0.2)
+        resistance_candidates += [last_high + atr * 0.3, last_high - atr * 0.2]
     if swing_lows:
         last_low = swing_lows[-1]["price"]
-        support_candidates.append(last_low - atr * 0.3)
-        support_candidates.append(last_low + atr * 0.2)
+        support_candidates += [last_low - atr * 0.3, last_low + atr * 0.2]
 
-    # Классические max/min как запасной вариант
     highs = [c[2] for c in candles[:-1]]
     lows = [c[3] for c in candles[:-1]]
     if highs:
@@ -217,28 +204,24 @@ def get_dynamic_levels(candles, atr, current_price):
     resistance = min([r for r in resistance_candidates if r > current_price], default=current_price * 1.02)
     support = max([s for s in support_candidates if s < current_price], default=current_price * 0.98)
 
-    # Если слишком далеко — берём ближайший
     if abs(resistance - current_price) / current_price > 0.04:
         resistance = current_price + atr * 1.8
     if abs(support - current_price) / current_price > 0.04:
         support = current_price - atr * 1.8
 
-    return support, resistance, swing_highs, swing_lows
+    return support, resistance
 
 def get_higher_tf_bias(symbol):
-    """Структура 1h + 4h"""
     try:
         ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe=HIGHER_TF_1H, limit=60)
         ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe=HIGHER_TF_4H, limit=40)
         if not ohlcv_1h or not ohlcv_4h:
-            return "neutral", 50.0
+            return "нейтральное", 50.0
 
         closes_1h = [c[4] for c in ohlcv_1h]
         closes_4h = [c[4] for c in ohlcv_4h]
         rsi_1h = calculate_rsi(closes_1h)
-        rsi_4h = calculate_rsi(closes_4h)
 
-        # Простая EMA-структура
         ema20_1h = np.mean(closes_1h[-20:])
         ema50_1h = np.mean(closes_1h[-50:]) if len(closes_1h) >= 50 else ema20_1h
         ema20_4h = np.mean(closes_4h[-20:])
@@ -257,19 +240,15 @@ def get_higher_tf_bias(symbol):
             score += 1
         elif rsi_1h < 45:
             score -= 1
-        if rsi_4h > 55:
-            score += 1
-        elif rsi_4h < 45:
-            score -= 1
 
         if score >= 3:
-            return "bullish", rsi_1h
+            return "бычье (растёт)", rsi_1h
         elif score <= -3:
-            return "bearish", rsi_1h
-        return "neutral", rsi_1h
+            return "медвежье (падает)", rsi_1h
+        return "нейтральное", rsi_1h
     except Exception as e:
         print(f"Ошибка higher TF {symbol}: {e}")
-        return "neutral", 50.0
+        return "нейтральное", 50.0
 
 # ====================== РЫНОЧНЫЕ ДАННЫЕ ======================
 @retry_on_error()
@@ -286,7 +265,6 @@ def get_top_symbols(limit=TOP_COINS_LIMIT):
 
     sorted_t = sorted(usdt.items(), key=lambda x: x[1].get('quoteVolume', 0) or 0, reverse=True)
     symbols = [item[0] for item in sorted_t[:limit]]
-    # Всегда держим BTC и ETH
     for must in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
         if must not in symbols:
             symbols.insert(0, must)
@@ -296,7 +274,6 @@ def get_top_symbols(limit=TOP_COINS_LIMIT):
 
 @retry_on_error()
 def get_btc_context():
-    """Волатильность + тренд BTC + доминация (прокси)"""
     try:
         ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=50)
         closes = [c[4] for c in ohlcv]
@@ -305,45 +282,28 @@ def get_btc_context():
         rsi = calculate_rsi(closes)
         change_24h = ((closes[-1] - closes[-24]) / closes[-24] * 100) if len(closes) >= 24 else 0
 
-        # Прокси доминации через относительную силу (упрощённо)
-        dominance_bias = "neutral"
-        if change_24h > 2.5 and rsi > 55:
-            dominance_bias = "btc_strong"
-        elif change_24h < -2.5 and rsi < 45:
-            dominance_bias = "btc_weak"
-
         extreme_vol = atr_pct > MAX_BTC_VOLATILITY_ATR
-        trend = "bullish" if rsi > 55 and change_24h > 0.8 else ("bearish" if rsi < 45 and change_24h < -0.8 else "neutral")
+        trend = "бычий" if rsi > 55 and change_24h > 0.8 else ("медвежий" if rsi < 45 and change_24h < -0.8 else "нейтральный")
         return {
             "atr_pct": atr_pct,
             "rsi": rsi,
             "change_24h": change_24h,
             "extreme_vol": extreme_vol,
-            "trend": trend,
-            "dominance_bias": dominance_bias
+            "trend": trend
         }
     except Exception as e:
         print(f"BTC context error: {e}")
-        return {"atr_pct": 1.0, "rsi": 50, "change_24h": 0, "extreme_vol": False, "trend": "neutral", "dominance_bias": "neutral"}
+        return {"atr_pct": 1.0, "rsi": 50, "change_24h": 0, "extreme_vol": False, "trend": "нейтральный"}
 
 @retry_on_error()
 def get_funding_and_oi(symbol):
     funding = 0.0
-    oi_change = 0.0
     try:
         fr = exchange.fetch_funding_rate(symbol)
-        funding = float(fr.get('fundingRate', 0) or 0) * 100  # в %
+        funding = float(fr.get('fundingRate', 0) or 0) * 100
     except:
         pass
-    try:
-        # OI change за последние ~1-2 часа (если биржа отдаёт)
-        oi = exchange.fetch_open_interest(symbol)
-        # У Bybit через ccxt иногда есть только текущий OI, поэтому делаем простую заглушку
-        # Для реальной динамики лучше хранить предыдущее значение, но здесь упрощённо
-        oi_change = 0.0
-    except:
-        pass
-    return funding, oi_change
+    return funding, 0.0
 
 @retry_on_error()
 def get_fear_greed():
@@ -367,7 +327,7 @@ def check_liquidations_improved(symbol, support, resistance, current_price):
             return None
 
         now_ms = time.time() * 1000
-        window_ms = 45 * 60 * 1000  # 45 минут
+        window_ms = 45 * 60 * 1000
         recent = [l for l in liquidations if now_ms - l.get('timestamp', 0) <= window_ms]
         if not recent:
             return None
@@ -379,25 +339,21 @@ def check_liquidations_improved(symbol, support, resistance, current_price):
             amount = liq.get('usdValue') or (liq.get('amount', 0) * liq.get('price', 0))
             total_vol += amount
             side = liq.get('side', '').lower()
-            if side == 'buy':      # ликвидация шортов
+            if side == 'buy':
                 shorts_liq += amount
-            elif side == 'sell':    # ликвидация лонгов
+            elif side == 'sell':
                 longs_liq += amount
 
         if total_vol < 80000:
             return None
 
-        # Предпочитаем каскады возле уровней
-        near_level = False
-        if abs(current_price - support) / support * 100 < 0.6 or abs(current_price - resistance) / resistance * 100 < 0.6:
-            near_level = True
+        near_level = abs(current_price - support) / support * 100 < 0.6 or abs(current_price - resistance) / resistance * 100 < 0.6
 
-        side_text = ""
         if shorts_liq > longs_liq * 1.3:
-            side_text = "🟢 Сбриты Шорты (импульс вверх → ищем ЛОНГ)"
+            side_text = "много людей выбило из коротких позиций — цена может продолжить рост"
             preferred = "long"
         else:
-            side_text = "🔴 Сбриты Лонги (импульс вниз → ищем ШОРТ)"
+            side_text = "много людей выбило из длинных позиций — цена может продолжить падение"
             preferred = "short"
 
         return {
@@ -437,7 +393,6 @@ def send_telegram_message(message, symbol, signal_key):
         print(f"Ошибка Telegram: {e}")
 
 def build_sl_tp(current_price, atr, direction):
-    """Подсказки SL / TP на основе ATR"""
     if direction == "long":
         sl = current_price - atr * ATR_SL_MULT
         tp1 = current_price + atr * ATR_TP1_MULT
@@ -454,6 +409,77 @@ def build_sl_tp(current_price, atr, direction):
         rr1 = reward1 / risk if risk > 0 else 0
     return sl, tp1, tp2, rr1
 
+def explain_rsi(rsi):
+    if rsi < 30:
+        return f"{rsi:.0f} — рынок сильно перепродан (хороший момент для покупки)"
+    if rsi < 40:
+        return f"{rsi:.0f} — рынок перепродан (можно рассматривать покупку)"
+    if rsi > 70:
+        return f"{rsi:.0f} — рынок сильно перекуплен (хороший момент для продажи)"
+    if rsi > 60:
+        return f"{rsi:.0f} — рынок перекуплен (можно рассматривать продажу)"
+    return f"{rsi:.0f} — рынок в нормальной зоне"
+
+def explain_stoch(k):
+    if k < 20:
+        return f"{k:.0f} — сильная перепроданность (возможен разворот вверх)"
+    if k < 30:
+        return f"{k:.0f} — перепроданность (возможен разворот вверх)"
+    if k > 80:
+        return f"{k:.0f} — сильная перекупленность (возможен разворот вниз)"
+    if k > 70:
+        return f"{k:.0f} — перекупленность (возможен разворот вниз)"
+    return f"{k:.0f} — нейтральная зона"
+
+def explain_macd(hist):
+    if hist > 0.001:
+        return f"положительный и растущий — сила у покупателей"
+    if hist > 0:
+        return f"слабо положительный — покупатели немного сильнее"
+    if hist < -0.001:
+        return f"отрицательный и падающий — сила у продавцов"
+    if hist < 0:
+        return f"слабо отрицательный — продавцы немного сильнее"
+    return "около нуля — нет явного преимущества"
+
+def explain_divergence(div):
+    if div == "bullish":
+        return "бычья — цена ещё падала, а сила уже росла (признак разворота вверх)"
+    if div == "bearish":
+        return "медвежья — цена ещё росла, а сила уже падала (признак разворота вниз)"
+    return "нет"
+
+def explain_funding(fund):
+    if fund > 0.03:
+        return f"{fund:.4f}% — высокая плата за лонги (осторожно с покупками)"
+    if fund > 0.01:
+        return f"{fund:.4f}% — небольшая плата за лонги"
+    if fund < -0.03:
+        return f"{fund:.4f}% — высокая плата за шорты (осторожно с продажами)"
+    if fund < -0.01:
+        return f"{fund:.4f}% — небольшая плата за шорты"
+    return f"{fund:.4f}% — почти ноль (нейтрально)"
+
+def explain_fng(fng):
+    if fng >= 75:
+        return f"{fng} — рынок очень жадный (высокий риск коррекции)"
+    if fng >= 55:
+        return f"{fng} — рынок в зоне жадности"
+    if fng <= 25:
+        return f"{fng} — рынок в страхе (возможны хорошие точки для покупки)"
+    if fng <= 45:
+        return f"{fng} — рынок скорее боится"
+    return f"{fng} — рынок спокойный"
+
+def explain_volume(is_spike, rising):
+    if is_spike and rising:
+        return "очень высокий и растущий — сильный интерес крупных игроков"
+    if is_spike:
+        return "повышенный — есть интерес"
+    if rising:
+        return "растёт — интерес увеличивается"
+    return "обычный"
+
 # ====================== ОСНОВНАЯ ЛОГИКА ======================
 def check_markets():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Проверка рынков...")
@@ -466,7 +492,7 @@ def check_markets():
     fng = get_fear_greed()
 
     if btc_ctx["extreme_vol"]:
-        print(f"⚠️ Экстремальная волатильность BTC (ATR {btc_ctx['atr_pct']:.2f}%) — фильтруем слабые сигналы")
+        print(f"⚠️ Экстремальная волатильность BTC — фильтруем слабые сигналы")
 
     for symbol in symbols:
         try:
@@ -489,37 +515,46 @@ def check_markets():
             rsi_series = [calculate_rsi(closes[:i+1]) for i in range(20, len(closes))]
             divergence = detect_rsi_divergence(closes, rsi_series) if len(rsi_series) > 15 else None
 
-            support, resistance, swing_highs, swing_lows = get_dynamic_levels(ohlcv, atr, current_price)
+            support, resistance = get_dynamic_levels(ohlcv, atr, current_price)
             bias_1h, rsi_1h = get_higher_tf_bias(symbol)
-            funding, oi_change = get_funding_and_oi(symbol)
+            funding, _ = get_funding_and_oi(symbol)
 
-            # Объём
             avg_vol = np.mean(volumes[-21:-1]) if len(volumes) >= 21 else last_vol
             is_volume_spike = last_vol >= avg_vol * MIN_VOLUME_SPIKE
-            rising_volume = all(volumes[-i] > volumes[-i-1] for i in range(1, MIN_RISING_VOLUME_BARS+1)) if len(volumes) > MIN_RISING_VOLUME_BARS else False
+            rising_volume = all(volumes[-i] > volumes[-i-1] for i in range(1, MIN_RISING_VOLUME_BARS + 1)) if len(volumes) > MIN_RISING_VOLUME_BARS else False
+
+            clean_name = symbol.split(':')[0]
 
             # ========== 0. ЛИКВИДАЦИИ ==========
             liq = check_liquidations_improved(symbol, support, resistance, current_price)
             if liq and (liq["near_level"] or liq["volume"] > 250000):
                 direction = "long" if liq["preferred"] == "long" else "short"
-                # Фильтр против тренда BTC
-                if (direction == "long" and btc_ctx["trend"] == "bearish" and btc_ctx["extreme_vol"]) or \
-                   (direction == "short" and btc_ctx["trend"] == "bullish" and btc_ctx["extreme_vol"]):
-                    pass
-                else:
+                if not ((direction == "long" and btc_ctx["trend"] == "медвежий" and btc_ctx["extreme_vol"]) or
+                        (direction == "short" and btc_ctx["trend"] == "бычий" and btc_ctx["extreme_vol"])):
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
+                    action = "ПОКУПАТЬ (ЛОНГ)" if direction == "long" else "ПРОДАВАТЬ (ШОРТ)"
                     msg = (
-                        f"💥 *КАСКАД ЛИКВИДАЦИЙ*\n"
-                        f"Монета: `{symbol.split(':')[0]}`\n"
-                        f"{liq['text']}\n"
-                        f"Объём: `${liq['volume']:,.0f}` {'✅ возле уровня' if liq['near_level'] else ''}\n"
-                        f"Цена: `{current_price}`\n"
-                        f"Bias 1h: `{bias_1h}` | RSI 1h: `{rsi_1h:.0f}`\n"
-                        f"Funding: `{funding:.4f}%` | F&G: `{fng}`\n"
-                        f"────────────────\n"
-                        f"🎯 *Рекомендация:* {'ЛОНГ 🟢' if direction=='long' else 'ШОРТ 🔴'}\n"
-                        f"SL: `{sl:.4f}` | TP1: `{tp1:.4f}` | TP2: `{tp2:.4f}`\n"
-                        f"R:R ≈ `{rr:.1f}`"
+                        f"💥 *РЕЗКОЕ ДВИЖЕНИЕ ИЗ-ЗА ЛИКВИДАЦИЙ*\n\n"
+                        f"Монета: `{clean_name}`\n"
+                        f"Текущая цена: `{current_price}`\n\n"
+                        f"*Что делать:* {action}\n\n"
+                        f"*Почему сигнал появился:*\n{liq['text']}\n\n"
+                        f"*Куда ставить ордера:*\n"
+                        f"• Вход: около `{current_price}`\n"
+                        f"• Стоп-лосс (защита): `{sl:.4f}`\n"
+                        f"• Цель 1: `{tp1:.4f}`\n"
+                        f"• Цель 2: `{tp2:.4f}`\n\n"
+                        f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
+                        f"——————————————\n"
+                        f"*Что показывают индикаторы:*\n\n"
+                        f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
+                        f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
+                        f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
+                        f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
+                        f"• Направление на 1 часе: {bias_1h}\n"
+                        f"• Плата за перенос позиции: {explain_funding(funding)}\n"
+                        f"• Настроение рынка: {explain_fng(fng)}\n"
+                        f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
                     )
                     send_telegram_message(msg, symbol, f"{symbol}_liq")
 
@@ -528,33 +563,47 @@ def check_markets():
             strong_body = abs(current_price - open_p) / (last[2] - last[3] + 1e-9) > 0.65
             if abs(candle_change) >= IMPULSE_PERCENT and is_volume_spike and rising_volume and strong_body:
                 direction = "long" if candle_change > 0 else "short"
-                # Фильтры
                 if btc_ctx["extreme_vol"] and abs(candle_change) < 2.2:
                     continue
-                if (direction == "long" and bias_1h == "bearish") or (direction == "short" and bias_1h == "bullish"):
+                if (direction == "long" and "медвежье" in bias_1h) or (direction == "short" and "бычье" in bias_1h):
                     continue
-                # OI + цена (если бы был реальный OI — усиливали бы)
-                oi_confirm = True  # заглушка, при наличии реального OI можно ужесточить
 
                 macd_ok = (macd_hist > 0 and direction == "long") or (macd_hist < 0 and direction == "short")
                 stoch_ok = (stoch_k < 80 and direction == "long") or (stoch_k > 20 and direction == "short")
 
                 if macd_ok or stoch_ok:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
-                    action = "🟢 ИЩЕМ ЛОНГ (импульс + объём)" if direction == "long" else "🔴 ИЩЕМ ШОРТ (импульс + объём)"
-                    dir_text = "🚀 МОЩНЫЙ ИМПУЛЬС РОСТА" if direction == "long" else "⚡️ МОЩНЫЙ ИМПУЛЬС ПАДЕНИЯ"
+                    if direction == "long":
+                        title = "🚀 СИЛЬНЫЙ РОСТ"
+                        action = "ПОКУПАТЬ (ЛОНГ)"
+                        reason = "цена резко выросла на очень большом объёме — это признак сильного интереса покупателей"
+                    else:
+                        title = "⚡️ СИЛЬНОЕ ПАДЕНИЕ"
+                        action = "ПРОДАВАТЬ (ШОРТ)"
+                        reason = "цена резко упала на очень большом объёме — это признак сильного интереса продавцов"
+
                     msg = (
-                        f"📊 *{dir_text}*\n"
-                        f"🎯 {action}\n"
-                        f"Монета: `{symbol.split(':')[0]}`\n"
-                        f"Изменение: `{candle_change:+.2f}%` | Объём x`{(last_vol/avg_vol):.1f}` ✅\n"
-                        f"RSI: `{rsi:.1f}` | Stoch: `{stoch_k:.0f}` | MACD hist: `{macd_hist:.5f}`\n"
-                        f"Bias 1h: `{bias_1h}` | Funding: `{funding:.4f}%`\n"
-                        f"F&G: `{fng}` | BTC trend: `{btc_ctx['trend']}`\n"
-                        f"────────────────\n"
-                        f"Вход ≈ `{current_price}`\n"
-                        f"SL: `{sl:.4f}` | TP1: `{tp1:.4f}` | TP2: `{tp2:.4f}`\n"
-                        f"R:R ≈ `{rr:.1f}`"
+                        f"*{title}*\n\n"
+                        f"Монета: `{clean_name}`\n"
+                        f"Текущая цена: `{current_price}`\n\n"
+                        f"*Что делать:* {action}\n\n"
+                        f"*Почему сигнал появился:*\n{reason}\n\n"
+                        f"*Куда ставить ордера:*\n"
+                        f"• Вход: около `{current_price}`\n"
+                        f"• Стоп-лосс (защита): `{sl:.4f}`\n"
+                        f"• Цель 1: `{tp1:.4f}`\n"
+                        f"• Цель 2: `{tp2:.4f}`\n\n"
+                        f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
+                        f"——————————————\n"
+                        f"*Что показывают индикаторы:*\n\n"
+                        f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
+                        f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
+                        f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
+                        f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
+                        f"• Направление на 1 часе: {bias_1h}\n"
+                        f"• Плата за перенос позиции: {explain_funding(funding)}\n"
+                        f"• Настроение рынка: {explain_fng(fng)}\n"
+                        f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
                     )
                     send_telegram_message(msg, symbol, f"{symbol}_impulse")
 
@@ -562,38 +611,44 @@ def check_markets():
             support_diff = abs(current_price - support) / support * 100
             if support_diff <= THRESHOLD_PERCENT:
                 is_bounce = (prev[4] < prev[1]) and (current_price > open_p)
-                rsi_ok = rsi < RSI_OVERSOLD or (divergence == "bullish")
-                stoch_ok = stoch_k < STOCH_OVERSOLD or stoch_d < STOCH_OVERSOLD
-                macd_ok = macd_hist > macd_hist  # просто наличие
+                rsi_ok = rsi < RSI_OVERSOLD or divergence == "bullish"
+                stoch_ok = stoch_k < STOCH_OVERSOLD
                 volume_ok = is_volume_spike or rising_volume
 
-                # Сильный фильтр против тренда
-                if bias_1h == "bearish" and btc_ctx["trend"] == "bearish":
-                    status = "⚠️ Подход к поддержке (старший ТФ против — ждём подтверждения)"
+                if "медвежье" in bias_1h and btc_ctx["trend"] == "медвежий":
+                    status = "цена подошла к уровню поддержки, но старший таймфрейм против — лучше подождать подтверждения"
                     strong = False
                 elif is_bounce and (rsi_ok or stoch_ok) and volume_ok:
-                    status = "🛡 *Отличная точка ЛОНГ* (отскок + объём + осциллятор)"
+                    status = "цена подошла к сильному уровню поддержки и отскочила вверх на объёме"
                     strong = True
                 else:
-                    status = "⚠️ Подход к поддержке (ждём паттерн / объём)"
+                    status = "цена подошла к уровню поддержки — ждём более чёткий отскок"
                     strong = False
 
                 if strong or support_diff < 0.12:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, "long")
                     msg = (
-                        f"🟢 *СИГНАЛ: УРОВЕНЬ ПОДДЕРЖКИ*\n"
-                        f"🎯 Рекомендация: *ЛОНГ 🟢*\n"
-                        f"Статус: {status}\n"
-                        f"Монета: `{symbol.split(':')[0]}`\n"
-                        f"Цена: `{current_price}` | Уровень: `{support:.4f}`\n"
-                        f"RSI: `{rsi:.1f}` {'🟢' if rsi_ok else ''} | Stoch K: `{stoch_k:.0f}`\n"
-                        f"MACD hist: `{macd_hist:.5f}` | Дивергенция: `{divergence or 'нет'}`\n"
-                        f"Bias 1h: `{bias_1h}` | Funding: `{funding:.4f}%` | F&G: `{fng}`\n"
-                        f"Объём: {'Да ✅' if volume_ok else 'Нет'}\n"
-                        f"────────────────\n"
-                        f"Вход ≈ `{current_price}`\n"
-                        f"SL: `{sl:.4f}` | TP1: `{tp1:.4f}` | TP2: `{tp2:.4f}`\n"
-                        f"R:R ≈ `{rr:.1f}`"
+                        f"🟢 *ХОРОШАЯ ТОЧКА ДЛЯ ПОКУПКИ*\n\n"
+                        f"Монета: `{clean_name}`\n"
+                        f"Текущая цена: `{current_price}`\n\n"
+                        f"*Что делать:* ПОКУПАТЬ (ЛОНГ)\n\n"
+                        f"*Почему сигнал появился:*\n{status}\n\n"
+                        f"*Куда ставить ордера:*\n"
+                        f"• Вход: около `{current_price}`\n"
+                        f"• Стоп-лосс (защита): `{sl:.4f}`\n"
+                        f"• Цель 1: `{tp1:.4f}`\n"
+                        f"• Цель 2: `{tp2:.4f}`\n\n"
+                        f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
+                        f"——————————————\n"
+                        f"*Что показывают индикаторы:*\n\n"
+                        f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
+                        f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
+                        f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
+                        f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
+                        f"• Направление на 1 часе: {bias_1h}\n"
+                        f"• Плата за перенос позиции: {explain_funding(funding)}\n"
+                        f"• Настроение рынка: {explain_fng(fng)}\n"
+                        f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
                     )
                     send_telegram_message(msg, symbol, f"{symbol}_support")
 
@@ -601,36 +656,44 @@ def check_markets():
             resist_diff = abs(current_price - resistance) / resistance * 100
             if resist_diff <= THRESHOLD_PERCENT:
                 is_reject = (prev[4] > prev[1]) and (current_price < open_p)
-                rsi_ok = rsi > RSI_OVERBOUGHT or (divergence == "bearish")
-                stoch_ok = stoch_k > STOCH_OVERBOUGHT or stoch_d > STOCH_OVERBOUGHT
+                rsi_ok = rsi > RSI_OVERBOUGHT or divergence == "bearish"
+                stoch_ok = stoch_k > STOCH_OVERBOUGHT
                 volume_ok = is_volume_spike or rising_volume
 
-                if bias_1h == "bullish" and btc_ctx["trend"] == "bullish":
-                    status = "⚠️ Подход к сопротивлению (старший ТФ против — ждём)"
+                if "бычье" in bias_1h and btc_ctx["trend"] == "бычий":
+                    status = "цена подошла к уровню сопротивления, но старший таймфрейм против — лучше подождать"
                     strong = False
                 elif is_reject and (rsi_ok or stoch_ok) and volume_ok:
-                    status = "🛡 *Отличная точка ШОРТ* (отбой + объём + осциллятор)"
+                    status = "цена подошла к сильному уровню сопротивления и отбилась вниз на объёме"
                     strong = True
                 else:
-                    status = "⚠️ Подход к сопротивлению (ждём паттерн / объём)"
+                    status = "цена подошла к уровню сопротивления — ждём более чёткий отбой"
                     strong = False
 
                 if strong or resist_diff < 0.12:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, "short")
                     msg = (
-                        f"🔴 *СИГНАЛ: УРОВЕНЬ СОПРОТИВЛЕНИЯ*\n"
-                        f"🎯 Рекомендация: *ШОРТ 🔴*\n"
-                        f"Статус: {status}\n"
-                        f"Монета: `{symbol.split(':')[0]}`\n"
-                        f"Цена: `{current_price}` | Уровень: `{resistance:.4f}`\n"
-                        f"RSI: `{rsi:.1f}` {'🔴' if rsi_ok else ''} | Stoch K: `{stoch_k:.0f}`\n"
-                        f"MACD hist: `{macd_hist:.5f}` | Дивергенция: `{divergence or 'нет'}`\n"
-                        f"Bias 1h: `{bias_1h}` | Funding: `{funding:.4f}%` | F&G: `{fng}`\n"
-                        f"Объём: {'Да ✅' if volume_ok else 'Нет'}\n"
-                        f"────────────────\n"
-                        f"Вход ≈ `{current_price}`\n"
-                        f"SL: `{sl:.4f}` | TP1: `{tp1:.4f}` | TP2: `{tp2:.4f}`\n"
-                        f"R:R ≈ `{rr:.1f}`"
+                        f"🔴 *ХОРОШАЯ ТОЧКА ДЛЯ ПРОДАЖИ*\n\n"
+                        f"Монета: `{clean_name}`\n"
+                        f"Текущая цена: `{current_price}`\n\n"
+                        f"*Что делать:* ПРОДАВАТЬ (ШОРТ)\n\n"
+                        f"*Почему сигнал появился:*\n{status}\n\n"
+                        f"*Куда ставить ордера:*\n"
+                        f"• Вход: около `{current_price}`\n"
+                        f"• Стоп-лосс (защита): `{sl:.4f}`\n"
+                        f"• Цель 1: `{tp1:.4f}`\n"
+                        f"• Цель 2: `{tp2:.4f}`\n\n"
+                        f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
+                        f"——————————————\n"
+                        f"*Что показывают индикаторы:*\n\n"
+                        f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
+                        f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
+                        f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
+                        f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
+                        f"• Направление на 1 часе: {bias_1h}\n"
+                        f"• Плата за перенос позиции: {explain_funding(funding)}\n"
+                        f"• Настроение рынка: {explain_fng(fng)}\n"
+                        f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
                     )
                     send_telegram_message(msg, symbol, f"{symbol}_resistance")
 
@@ -639,8 +702,8 @@ def check_markets():
 
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
-    print("🚀 Супер-бот v2 запущен (фракталы + ATR + мульти-ТФ + фильтры + информативные алерты)")
-    print("Режим: только сигналы. Реальную торговлю веди вручную с жёстким риском!")
+    print("🚀 Бот запущен (простые и понятные сообщения для новичка)")
+    print("Режим: только сигналы. Реальную торговлю веди вручную!")
     while True:
         try:
             check_markets()
