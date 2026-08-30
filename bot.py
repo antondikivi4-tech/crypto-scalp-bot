@@ -24,7 +24,6 @@ exchange = ccxt.bybit({
 
 def get_top_symbols(limit=6):
     try:
-        # Получаем тикеры для бессрочных фьючерсов (linear)
         tickers = exchange.fetch_tickers()
         usdt_tickers = {s: t for s, t in tickers.items() if s.endswith('/USDT:USDT') or ('/USDT' in s and ':' in s)}
         if not usdt_tickers:
@@ -48,7 +47,6 @@ def send_telegram_message(message, symbol, signal_key):
         
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
-    # Очищаем символ для ссылки на Bybit (например, BTC/USDT:USDT -> BTCUSDT)
     clean_symbol = symbol.split(':')[0].replace('/', '')
     bybit_url = f"https://www.bybit.com/trade/usdt/{clean_symbol}"
     
@@ -97,28 +95,24 @@ def get_support_resistance(candles):
 
 def check_liquidations(symbol):
     try:
-        # Получаем последние ликвидации по инструменту
         liquidations = exchange.fetch_liquidations(symbol, limit=20)
         if not liquidations:
             return None
         
-        # Считаем суммарный объем ликвидаций за последнее время
         recent_liq_volume = 0
         longs_liquidated = 0
         shorts_liquidated = 0
         
-        current_time = time.time() * 1000  копируем в мс
+        current_time = time.time() * 1000  # переводим в миллисекунды
         for liq in liquidations:
-            # Берем ликвидации за последние 15 минут (900000 мс)
             if current_time - liq.get('timestamp', 0) <= 900000:
                 amount = liq.get('usdValue', 0) or (liq.get('amount', 0) * liq.get('price', 0))
                 recent_liq_volume += amount
-                if liq.get('side') == 'buy':  # Ликвидация шорта (бай)
+                if liq.get('side') == 'buy':  
                     shorts_liquidated += amount
-                elif liq.get('side') == 'sell':  # Ликвидация лонга (селл)
+                elif liq.get('side') == 'sell':  
                     longs_liquidated += amount
                     
-        # порог крупного каскада ликвидаций (например, от $100,000 за 15 минут)
         if recent_liq_volume >= 100000:
             side_text = "🟢 Сбриты Шорты (Каскад роста)" if shorts_liquidated > longs_liquidated else "🔴 Сбриты Лонги (Каскад падения)"
             return {
@@ -126,7 +120,6 @@ def check_liquidations(symbol):
                 "volume": recent_liq_volume
             }
     except Exception as e:
-        # Некоторые пары могут не отдавать ликвидации через публичный API, пропускаем тихо
         pass
     return None
 
@@ -156,7 +149,7 @@ def check_markets():
             rsi = calculate_rsi(closes)
             support, resistance = get_support_resistance(ohlcv)
             
-            # 0. Проверка ликвидаций (Каскад сбрития стопов)
+            # 0. Проверка ликвидаций
             liq_data = check_liquidations(symbol)
             if liq_data:
                 liq_msg = (
