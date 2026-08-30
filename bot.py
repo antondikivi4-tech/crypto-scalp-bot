@@ -10,7 +10,11 @@ CHAT_ID = os.getenv("CHAT_ID", "673791974")
 TIMEFRAME = "15"
 THRESHOLD_PERCENT = 0.15 
 IMPULSE_PERCENT = 1.5
-TOP_COINS_LIMIT = 6  блок динамического отбора топ монет
+TOP_COINS_LIMIT = 6
+
+# Словарь для защиты от спама (хранит время последнего сигнала по каждому ключу)
+sent_signals = {}
+COOLDOWN_TIME = 3600  # 1 час кулдауна для одного и того же уровня/импульса по монете
 
 exchange = ccxt.bybit()
 
@@ -24,13 +28,17 @@ def get_top_symbols(limit=6):
             reverse=True
         )
         top_symbols = [item[0] for item in sorted_tickers[:limit]]
-        print(f"Динамический топ монет по объему: {top_symbols}")
         return top_symbols
     except Exception as e:
         print(f"Ошибка получения топ монет, используем резерв: {e}")
         return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 
-def send_telegram_message(message, symbol):
+def send_telegram_message(message, symbol, signal_key):
+    current_time = time.time()
+    # Проверяем кулдаун (защита от флуда)
+    if current_time - sent_signals.get(signal_key, 0) < COOLDOWN_TIME:
+        return  # Сигнал уже отправлялся недавно, пропускаем
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     base, quote = symbol.split('/')
     bybit_url = f"https://www.bybit.com/trade/spot/{base}/{quote}"
@@ -46,7 +54,9 @@ def send_telegram_message(message, symbol):
         }
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            sent_signals[signal_key] = current_time  # Запоминаем время отправки
     except Exception as e:
         print(f"Ошибка отправки в Telegram: {e}")
 
@@ -77,7 +87,7 @@ def get_support_resistance(candles):
     return support, resistance
 
 def check_markets():
-    print("Проверка рынков (Топ объем + RSI + Объемы + Уровни)...")
+    print("Проверка рынков (с защитой от повторных сигналов)...")
     symbols = get_top_symbols(TOP_COINS_LIMIT)
     
     for symbol in symbols:
@@ -96,14 +106,13 @@ def check_markets():
             current_price = last_candle[4]
             last_volume = last_candle[5]
             
-            # Средний объем за последние 20 свечей для поиска всплеска
             avg_volume = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else last_volume
             is_volume_spike = last_volume >= (avg_volume * 1.8)
             
             rsi = calculate_rsi(closes)
             support, resistance = get_support_resistance(ohlcv)
             
-            # 1. Анализ импульса с подтверждением объема
+            # 1. Импульс
             candle_change = ((current_price - open_price) / open_price) * 100
             if abs(candle_change) >= IMPULSE_PERCENT and is_volume_spike:
                 direction_text = "🚀 МОЩНЫЙ ИМПУЛЬС РОСТА" if candle_change > 0 else "⚡️ МОЩНЫЙ ИМПУЛЬС ПАДЕНИЯ"
@@ -115,13 +124,14 @@ def check_markets():
                     f"RSI: `{rsi:.1f}`\n"
                     f"Цена сейчас: `{current_price}`"
                 )
-                send_telegram_message(impulse_msg, symbol)
+                signal_key = f"{symbol}_impulse"
+                send_telegram_message(impulse_msg, symbol, signal_key)
 
-            # 2. Подход к поддержке с фильтрами RSI и безопасности
+            # 2. Поддержка
             support_diff = abs(current_price - support) / support * 100
             if support_diff <= THRESHOLD_PERCENT:
                 is_safe_bounce = (prev_candle[4] < prev_candle[1]) and (current_price > open_price)
-                rsi_filter = rsi < 40  # Зона перепроданности для лонга
+                rsi_filter = rsi < 40
                 
                 status_desc = "🛡 *Отличная точка (RSI внизу + отскок)*" if (is_safe_bounce and rsi_filter) else "⚠️ *Подход к уровню*"
                 
@@ -134,13 +144,14 @@ def check_markets():
                     f"RSI (14): `{rsi:.1f}` {'🟢 Перепроданность' if rsi_filter else ''}\n"
                     f"Объем выше среднего: {'Да ✅' if is_volume_spike else 'Нет ❌'}"
                 )
-                send_telegram_message(message, symbol)
+                signal_key = f"{symbol}_support"
+                send_telegram_message(message, symbol, signal_key)
             
-            # 3. Подход к сопротивлению с фильтрами RSI и безопасности
+            # 3. Сопротивление
             resistance_diff = abs(current_price - resistance) / resistance * 100
             if resistance_diff <= THRESHOLD_PERCENT:
                 is_safe_rejection = (prev_candle[4] > prev_candle[1]) and (current_price < open_price)
-                rsi_filter = rsi > 60  # Зона перекупленности для шорта
+                rsi_filter = rsi > 60
                 
                 status_desc = "🛡 *Отличная точка (RSI вверху + отскок)*" if (is_safe_rejection and rsi_filter) else "⚠️ *Подход к уровню*"
                 
@@ -153,13 +164,14 @@ def check_markets():
                     f"RSI (14): `{rsi:.1f}` {'🔴 Перекупленность' if rsi_filter else ''}\n"
                     f"Объем выше среднего: {'Да ✅' if is_volume_spike else 'Нет ❌'}"
                 )
-                send_telegram_message(message, symbol)
+                signal_key = f"{symbol}_resistance"
+                send_telegram_message(message, symbol, signal_key)
                 
         except Exception as e:
             print(f"Ошибка при обработке {symbol}: {e}")
 
 if __name__ == "__main__":
-    print("Супер-бот запущен с динамическим отбором, RSI и инлайн-кнопками...")
+    print("Супер-бот запущен с защитой от флуда...")
     while True:
         check_markets()
         time.sleep(180)
