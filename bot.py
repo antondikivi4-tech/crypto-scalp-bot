@@ -16,16 +16,31 @@ CHAT_ID = os.getenv("CHAT_ID", "673791974")
 CONFIG_FILE = "bot_config.json"
 SIGNALS_FILE = "signals_history.json"
 
-# Значения по умолчанию (будут перезаписаны из файла, если он есть)
+# Значения по умолчанию
 DEFAULT_CONFIG = {
     "ACCOUNT_BALANCE": 1000.0,
     "RISK_PERCENT": 0.8,
     "STRONG_MODE": False
 }
 
+def load_json(filename, default):
+    try:
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except:
+        pass
+    return default
+
+def save_json(filename, data):
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Ошибка записи {filename}: {e}")
+
 def load_config():
     cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
-    # Подтягиваем из env, если заданы
     if os.getenv("ACCOUNT_BALANCE"):
         cfg["ACCOUNT_BALANCE"] = float(os.getenv("ACCOUNT_BALANCE"))
     return cfg
