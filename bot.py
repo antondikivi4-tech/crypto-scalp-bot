@@ -6,60 +6,66 @@ import ccxt
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import numpy as np
 
 # ====================== НАСТРОЙКИ ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "673791974")
 
-# --- Капитал и риск ---
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 1000))   # твой депозит
-RISK_PERCENT = 0.8                                            # риск на сделку %
+CONFIG_FILE = "bot_config.json"
+SIGNALS_FILE = "signals_history.json"
 
-# --- Режим ---
-STRONG_MODE = False           # True = только очень сильные сигналы
+# Значения по умолчанию (будут перезаписаны из файла, если он есть)
+DEFAULT_CONFIG = {
+    "ACCOUNT_BALANCE": 1000.0,
+    "RISK_PERCENT": 0.8,
+    "STRONG_MODE": False
+}
+
+def load_config():
+    cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
+    # Подтягиваем из env, если заданы
+    if os.getenv("ACCOUNT_BALANCE"):
+        cfg["ACCOUNT_BALANCE"] = float(os.getenv("ACCOUNT_BALANCE"))
+    return cfg
+
+def save_config(cfg):
+    save_json(CONFIG_FILE, cfg)
+
+config = load_config()
 
 TIMEFRAME = "15m"
 HIGHER_TF_1H = "1h"
 HIGHER_TF_4H = "4h"
 
-THRESHOLD_PERCENT = 0.13 if STRONG_MODE else 0.15
-IMPULSE_PERCENT = 2.0 if STRONG_MODE else 1.7
 TOP_COINS_LIMIT = 8
-COOLDOWN_TIME = 3600 if STRONG_MODE else 3200
 CACHE_TOP_SECONDS = 300
 CACHE_HIGHER_TF_SECONDS = 240
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.6
+MAX_WORKERS = 6
 
 ATR_SL_MULT = 1.3
 ATR_TP1_MULT = 2.2
 ATR_TP2_MULT = 3.5
 
-MIN_VOLUME_SPIKE = 2.4 if STRONG_MODE else 2.1
 MIN_RISING_VOLUME_BARS = 2
-RSI_OVERSOLD = 30 if STRONG_MODE else 33
-RSI_OVERBOUGHT = 70 if STRONG_MODE else 67
 STOCH_OVERSOLD = 18
 STOCH_OVERBOUGHT = 82
 MAX_BTC_VOLATILITY_ATR = 2.5
 
 REQUIRE_HIGHER_TF_ALIGN = True
 REQUIRE_VOLUME_SPIKE = True
-MIN_RR_RATIO = 1.7 if STRONG_MODE else 1.6
 STRICT_BTC_FILTER = True
-MAX_SIGNALS_PER_CYCLE = 1 if STRONG_MODE else 2
-MAX_WORKERS = 6
-
-# Файлы для хранения
-SIGNALS_FILE = "signals_history.json"
-STATS_FILE = "daily_stats.json"
 
 sent_signals = {}
 top_symbols_cache = {"symbols": [], "timestamp": 0}
 fear_greed_cache = {"value": 50, "timestamp": 0}
 higher_tf_cache = {}
 last_report_date = None
+last_update_id = 0
+bot_paused = False
 
 exchange = ccxt.bybit({
     'options': {'defaultType': 'linear'},
@@ -68,22 +74,6 @@ exchange = ccxt.bybit({
 })
 
 # ====================== УТИЛИТЫ ======================
-def retry_on_error(max_retries=MAX_RETRIES, base_delay=BACKOFF_BASE):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except (ccxt.NetworkError, ccxt.ExchangeError, requests.RequestException):
-                    time.sleep(base_delay ** attempt + np.random.uniform(0, 0.3))
-                except Exception as e:
-                    print(f"[Error] {func.__name__}: {e}")
-                    return None
-            return None
-        return wrapper
-    return decorator
-
 def load_json(filename, default):
     try:
         if os.path.exists(filename):
@@ -100,19 +90,48 @@ def save_json(filename, data):
     except Exception as e:
         print(f"Ошибка записи {filename}: {e}")
 
+def get_dynamic_params():
+    """Возвращает параметры в зависимости от STRONG_MODE"""
+    strong = config["STRONG_MODE"]
+    return {
+        "THRESHOLD_PERCENT": 0.12 if strong else 0.15,
+        "IMPULSE_PERCENT": 2.1 if strong else 1.7,
+        "COOLDOWN_TIME": 4000 if strong else 3200,
+        "MIN_VOLUME_SPIKE": 2.5 if strong else 2.1,
+        "RSI_OVERSOLD": 28 if strong else 33,
+        "RSI_OVERBOUGHT": 72 if strong else 67,
+        "MIN_RR_RATIO": 1.8 if strong else 1.6,
+        "MAX_SIGNALS_PER_CYCLE": 1 if strong else 2,
+    }
+
+def retry_on_error(max_retries=MAX_RETRIES, base_delay=BACKOFF_BASE):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (ccxt.NetworkError, ccxt.ExchangeError, requests.RequestException):
+                    time.sleep(base_delay ** attempt + np.random.uniform(0, 0.3))
+                except Exception as e:
+                    print(f"[Error] {func.__name__}: {e}")
+                    return None
+            return None
+        return wrapper
+    return decorator
+
 def get_session_info():
-    """Возвращает текущую сессию и рекомендацию"""
     hour = datetime.now(timezone.utc).hour
     if 0 <= hour < 7:
         return "Азиатская", "низкая ликвидность", False
     elif 7 <= hour < 12:
-        return "Лондонская (открытие)", "хорошая", True
+        return "Лондонская", "хорошая", True
     elif 12 <= hour < 16:
         return "Лондон + Нью-Йорк", "очень хорошая", True
     elif 16 <= hour < 21:
         return "Нью-Йоркская", "хорошая", True
     else:
-        return "Поздний Нью-Йорк / Азия", "средняя", True
+        return "Поздний Нью-Йорк", "средняя", True
 
 # ====================== ИНДИКАТОРЫ ======================
 def calculate_atr(candles, period=14):
@@ -249,7 +268,6 @@ def get_dynamic_levels(candles, atr, current_price):
     return support, resistance
 
 def get_volume_delta(symbol, limit=30):
-    """Приблизительная дельта по последним сделкам"""
     try:
         trades = exchange.fetch_trades(symbol, limit=limit)
         if not trades:
@@ -382,17 +400,15 @@ def check_liquidations(symbol, support, resistance, current_price):
     except:
         return None
 
-# ====================== ТРЕКЕР РЕЗУЛЬТАТОВ ======================
+# ====================== ТРЕКЕР ======================
 def save_signal(signal_data):
     history = load_json(SIGNALS_FILE, [])
     history.append(signal_data)
-    # Храним только последние 200 сигналов
     if len(history) > 200:
         history = history[-200:]
     save_json(SIGNALS_FILE, history)
 
 def update_signal_results():
-    """Проверяет старые сигналы и обновляет их результат"""
     history = load_json(SIGNALS_FILE, [])
     updated = False
     now = time.time()
@@ -400,9 +416,9 @@ def update_signal_results():
         if sig.get("result") is not None:
             continue
         age_min = (now - sig["timestamp"]) / 60
-        if age_min < 40:  # ещё рано проверять
+        if age_min < 40:
             continue
-        if age_min > 180:  # слишком старый
+        if age_min > 180:
             sig["result"] = "expired"
             updated = True
             continue
@@ -410,9 +426,7 @@ def update_signal_results():
             ticker = exchange.fetch_ticker(sig["symbol"])
             current = ticker["last"]
             direction = sig["direction"]
-            entry = sig["entry"]
-            sl = sig["sl"]
-            tp1 = sig["tp1"]
+            entry, sl, tp1 = sig["entry"], sig["sl"], sig["tp1"]
             if direction == "long":
                 if current >= tp1:
                     sig["result"] = "win"
@@ -464,8 +478,9 @@ def send_telegram(message, reply_markup=None):
         return False
 
 def send_signal_message(message, symbol, signal_key, signal_data):
+    params = get_dynamic_params()
     now = time.time()
-    if now - sent_signals.get(signal_key, 0) < COOLDOWN_TIME:
+    if now - sent_signals.get(signal_key, 0) < params["COOLDOWN_TIME"]:
         return False
     clean = symbol.split(':')[0].replace('/', '')
     markup = {
@@ -496,16 +511,11 @@ def build_sl_tp(current_price, atr, direction):
     return sl, tp1, tp2, rr
 
 def calc_position_size(entry, sl, direction):
-    """Расчёт размера позиции под риск"""
-    risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
-    if direction == "long":
-        risk_per_unit = entry - sl
-    else:
-        risk_per_unit = sl - entry
+    risk_amount = config["ACCOUNT_BALANCE"] * (config["RISK_PERCENT"] / 100)
+    risk_per_unit = (entry - sl) if direction == "long" else (sl - entry)
     if risk_per_unit <= 0:
         return 0.0
-    size = risk_amount / risk_per_unit
-    return round(size, 4)
+    return round(risk_amount / risk_per_unit, 4)
 
 def explain_rsi(rsi):
     if rsi < 30: return f"{rsi:.0f} — сильно перепродан"
@@ -542,9 +552,132 @@ def explain_volume(is_spike, rising, delta_text):
     base = "очень высокий" if is_spike and rising else ("повышенный" if is_spike else "обычный")
     return f"{base}, {delta_text}"
 
+# ====================== КОМАНДЫ TELEGRAM ======================
+def handle_commands():
+    global last_update_id, bot_paused, config
+    global_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        r = requests.get(global_url, params={"offset": last_update_id + 1, "timeout": 1}, timeout=5)
+        data = r.json()
+        if not data.get("ok"):
+            return
+        for upd in data.get("result", []):
+            last_update_id = upd["update_id"]
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+            chat_id = str(msg["chat"]["id"])
+            if chat_id != str(CHAT_ID):
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+
+            parts = text.split()
+            cmd = parts[0].lower().split("@")[0]
+
+            if cmd == "/help":
+                send_telegram(
+                    "*Команды бота:*\n\n"
+                    "`/balance 1500` — изменить депозит\n"
+                    "`/risk 0.7` — изменить риск (%)\n"
+                    "`/strong on` — только сильные сигналы\n"
+                    "`/strong off` — обычный режим\n"
+                    "`/status` — текущие настройки\n"
+                    "`/stats` — статистика сигналов\n"
+                    "`/pause` — временно остановить сигналы\n"
+                    "`/resume` — возобновить сигналы\n"
+                    "`/help` — эта справка"
+                )
+
+            elif cmd == "/status":
+                params = get_dynamic_params()
+                mode = "Только сильные" if config["STRONG_MODE"] else "Обычный"
+                pause_text = "⏸ На паузе" if bot_paused else "▶️ Работает"
+                send_telegram(
+                    f"*Текущие настройки*\n\n"
+                    f"• Депозит: `${config['ACCOUNT_BALANCE']:,.0f}`\n"
+                    f"• Риск на сделку: `{config['RISK_PERCENT']}%`\n"
+                    f"• Режим: `{mode}`\n"
+                    f"• Статус: {pause_text}\n"
+                    f"• Макс. сигналов за цикл: `{params['MAX_SIGNALS_PER_CYCLE']}`"
+                )
+
+            elif cmd == "/balance" and len(parts) == 2:
+                try:
+                    val = float(parts[1].replace(",", "."))
+                    if val < 10:
+                        send_telegram("Депозит слишком маленький (минимум 10)")
+                    else:
+                        config["ACCOUNT_BALANCE"] = val
+                        save_config(config)
+                        send_telegram(f"✅ Депозит изменён на `${val:,.0f}`")
+                except:
+                    send_telegram("Неверный формат. Пример: `/balance 1500`")
+
+            elif cmd == "/risk" and len(parts) == 2:
+                try:
+                    val = float(parts[1].replace(",", "."))
+                    if not (0.1 <= val <= 5):
+                        send_telegram("Риск должен быть от 0.1% до 5%")
+                    else:
+                        config["RISK_PERCENT"] = val
+                        save_config(config)
+                        send_telegram(f"✅ Риск изменён на `{val}%`")
+                except:
+                    send_telegram("Неверный формат. Пример: `/risk 0.7`")
+
+            elif cmd == "/strong" and len(parts) == 2:
+                arg = parts[1].lower()
+                if arg in ("on", "1", "true", "вкл"):
+                    config["STRONG_MODE"] = True
+                    save_config(config)
+                    send_telegram("✅ Включён режим *только сильные сигналы*")
+                elif arg in ("off", "0", "false", "выкл"):
+                    config["STRONG_MODE"] = False
+                    save_config(config)
+                    send_telegram("✅ Включён *обычный режим*")
+                else:
+                    send_telegram("Используй: `/strong on` или `/strong off`")
+
+            elif cmd == "/stats":
+                stats = get_stats_summary(days=1)
+                stats7 = get_stats_summary(days=7)
+                text = "*Статистика сигналов*\n\n"
+                if stats:
+                    text += f"За сутки: {stats['total']} сигналов\nПрибыльных: {stats['wins']} | Убыточных: {stats['losses']}\nВинрейт: {stats['winrate']:.1f}%\n\n"
+                else:
+                    text += "За сутки пока нет закрытых сигналов\n\n"
+                if stats7:
+                    text += f"За 7 дней: {stats7['total']} сигналов\nВинрейт: {stats7['winrate']:.1f}%"
+                else:
+                    text += "За 7 дней пока недостаточно данных"
+                send_telegram(text)
+
+            elif cmd == "/pause":
+                bot_paused = True
+                send_telegram("⏸ Бот поставлен на паузу. Сигналы временно не отправляются.\nЧтобы возобновить: `/resume`")
+
+            elif cmd == "/resume":
+                bot_paused = False
+                send_telegram("▶️ Бот снова работает")
+
+    except Exception as e:
+        print(f"Ошибка команд: {e}")
+
+def command_loop():
+    """Фоновый поток для обработки команд"""
+    while True:
+        try:
+            handle_commands()
+        except Exception as e:
+            print(f"Command loop error: {e}")
+        time.sleep(3)
+
 # ====================== ОБРАБОТКА МОНЕТЫ ======================
 def process_symbol(symbol, btc_ctx, fng, session_ok):
-    if not session_ok and STRONG_MODE:
+    params = get_dynamic_params()
+    if not session_ok and config["STRONG_MODE"]:
         return []
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=70)
@@ -567,7 +700,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
         delta, delta_text = get_volume_delta(symbol)
 
         avg_vol = np.mean(volumes[-21:-1]) if len(volumes) >= 21 else last_vol
-        is_volume_spike = last_vol >= avg_vol * MIN_VOLUME_SPIKE
+        is_volume_spike = last_vol >= avg_vol * params["MIN_VOLUME_SPIKE"]
         rising_volume = len(volumes) > 3 and volumes[-1] > volumes[-2] > volumes[-3]
 
         clean_name = symbol.split(':')[0]
@@ -586,7 +719,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
                     pass
                 else:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
-                    if rr >= MIN_RR_RATIO:
+                    if rr >= params["MIN_RR_RATIO"]:
                         size = calc_position_size(current_price, sl, direction)
                         funding = get_funding(symbol)
                         action = "ПОКУПАТЬ (ЛОНГ)" if direction == "long" else "ПРОДАВАТЬ (ШОРТ)"
@@ -595,7 +728,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
                             f"Монета: `{clean_name}`\nЦена: `{current_price}`\n\n"
                             f"*Что делать:* {action}\n\n*Почему:*\n{liq['text']}\n\n"
                             f"*Куда ставить:*\n• Вход: `{current_price}`\n• Стоп: `{sl:.4f}`\n• Цель 1: `{tp1:.4f}`\n• Цель 2: `{tp2:.4f}`\n\n"
-                            f"*Размер позиции (риск {RISK_PERCENT}%):* ≈ `{size}`\n"
+                            f"*Размер позиции (риск {config['RISK_PERCENT']}%):* ≈ `{size}`\n"
                             f"Риск/Прибыль: 1 к {rr:.1f}\n\n——————————————\n"
                             f"• RSI: {explain_rsi(rsi)}\n• Stochastic: {explain_stoch(stoch_k)}\n"
                             f"• MACD: {explain_macd(macd_hist)}\n• Дивергенция: {explain_divergence(divergence)}\n"
@@ -613,7 +746,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
         # Импульс
         candle_change = ((current_price - open_p) / open_p) * 100
         strong_body = abs(current_price - open_p) / (last[2] - last[3] + 1e-9) > 0.7
-        if abs(candle_change) >= IMPULSE_PERCENT and is_volume_spike and rising_volume and strong_body:
+        if abs(candle_change) >= params["IMPULSE_PERCENT"] and is_volume_spike and rising_volume and strong_body:
             direction = "long" if candle_change > 0 else "short"
             good = True
             if btc_ctx["extreme_vol"] and abs(candle_change) < 2.4:
@@ -627,7 +760,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
                 delta_ok = (delta > 10 and direction == "long") or (delta < -10 and direction == "short")
                 if macd_ok or delta_ok:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
-                    if rr >= MIN_RR_RATIO:
+                    if rr >= params["MIN_RR_RATIO"]:
                         size = calc_position_size(current_price, sl, direction)
                         funding = get_funding(symbol)
                         title = "🚀 СИЛЬНЫЙ РОСТ" if direction == "long" else "⚡️ СИЛЬНОЕ ПАДЕНИЕ"
@@ -637,7 +770,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
                             f"*{title}*\n\nМонета: `{clean_name}`\nЦена: `{current_price}`\n\n"
                             f"*Что делать:* {action}\n\n*Почему:*\n{reason}\n\n"
                             f"*Куда ставить:*\n• Вход: `{current_price}`\n• Стоп: `{sl:.4f}`\n• Цель 1: `{tp1:.4f}`\n• Цель 2: `{tp2:.4f}`\n\n"
-                            f"*Размер позиции (риск {RISK_PERCENT}%):* ≈ `{size}`\n"
+                            f"*Размер позиции (риск {config['RISK_PERCENT']}%):* ≈ `{size}`\n"
                             f"Риск/Прибыль: 1 к {rr:.1f}\n\n——————————————\n"
                             f"• RSI: {explain_rsi(rsi)}\n• Stochastic: {explain_stoch(stoch_k)}\n"
                             f"• MACD: {explain_macd(macd_hist)}\n• Дивергенция: {explain_divergence(divergence)}\n"
@@ -654,17 +787,17 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
 
         # Поддержка
         support_diff = abs(current_price - support) / support * 100
-        if support_diff <= THRESHOLD_PERCENT:
+        if support_diff <= params["THRESHOLD_PERCENT"]:
             is_bounce = (prev[4] < prev[1]) and (current_price > open_p)
-            rsi_ok = rsi < RSI_OVERSOLD or divergence == "bullish"
+            rsi_ok = rsi < params["RSI_OVERSOLD"] or divergence == "bullish"
             stoch_ok = stoch_k < STOCH_OVERSOLD
             volume_ok = is_volume_spike if REQUIRE_VOLUME_SPIKE else True
             delta_ok = delta > 5
             if not (REQUIRE_HIGHER_TF_ALIGN and "медвежье" in bias_1h) and not (STRICT_BTC_FILTER and btc_ctx["trend"] == "медвежий"):
-                strong = is_bounce and (rsi_ok or stoch_ok) and volume_ok and (delta_ok or not STRONG_MODE)
+                strong = is_bounce and (rsi_ok or stoch_ok) and volume_ok and (delta_ok or not config["STRONG_MODE"])
                 if strong or support_diff < 0.08:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, "long")
-                    if rr >= MIN_RR_RATIO:
+                    if rr >= params["MIN_RR_RATIO"]:
                         size = calc_position_size(current_price, sl, "long")
                         funding = get_funding(symbol)
                         status = "цена подошла к поддержке и отскочила на объёме" if strong else "цена очень близко к сильной поддержке"
@@ -672,7 +805,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
                             f"🟢 *ХОРОШАЯ ТОЧКА ДЛЯ ПОКУПКИ*\n\nМонета: `{clean_name}`\nЦена: `{current_price}`\n\n"
                             f"*Что делать:* ПОКУПАТЬ (ЛОНГ)\n\n*Почему:*\n{status}\n\n"
                             f"*Куда ставить:*\n• Вход: `{current_price}`\n• Стоп: `{sl:.4f}`\n• Цель 1: `{tp1:.4f}`\n• Цель 2: `{tp2:.4f}`\n\n"
-                            f"*Размер позиции (риск {RISK_PERCENT}%):* ≈ `{size}`\n"
+                            f"*Размер позиции (риск {config['RISK_PERCENT']}%):* ≈ `{size}`\n"
                             f"Риск/Прибыль: 1 к {rr:.1f}\n\n——————————————\n"
                             f"• RSI: {explain_rsi(rsi)}\n• Stochastic: {explain_stoch(stoch_k)}\n"
                             f"• MACD: {explain_macd(macd_hist)}\n• Дивергенция: {explain_divergence(divergence)}\n"
@@ -689,17 +822,17 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
 
         # Сопротивление
         resist_diff = abs(current_price - resistance) / resistance * 100
-        if resist_diff <= THRESHOLD_PERCENT:
+        if resist_diff <= params["THRESHOLD_PERCENT"]:
             is_reject = (prev[4] > prev[1]) and (current_price < open_p)
-            rsi_ok = rsi > RSI_OVERBOUGHT or divergence == "bearish"
+            rsi_ok = rsi > params["RSI_OVERBOUGHT"] or divergence == "bearish"
             stoch_ok = stoch_k > STOCH_OVERBOUGHT
             volume_ok = is_volume_spike if REQUIRE_VOLUME_SPIKE else True
             delta_ok = delta < -5
             if not (REQUIRE_HIGHER_TF_ALIGN and "бычье" in bias_1h) and not (STRICT_BTC_FILTER and btc_ctx["trend"] == "бычий"):
-                strong = is_reject and (rsi_ok or stoch_ok) and volume_ok and (delta_ok or not STRONG_MODE)
+                strong = is_reject and (rsi_ok or stoch_ok) and volume_ok and (delta_ok or not config["STRONG_MODE"])
                 if strong or resist_diff < 0.08:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, "short")
-                    if rr >= MIN_RR_RATIO:
+                    if rr >= params["MIN_RR_RATIO"]:
                         size = calc_position_size(current_price, sl, "short")
                         funding = get_funding(symbol)
                         status = "цена подошла к сопротивлению и отбилась на объёме" if strong else "цена очень близко к сильному сопротивлению"
@@ -707,7 +840,7 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
                             f"🔴 *ХОРОШАЯ ТОЧКА ДЛЯ ПРОДАЖИ*\n\nМонета: `{clean_name}`\nЦена: `{current_price}`\n\n"
                             f"*Что делать:* ПРОДАВАТЬ (ШОРТ)\n\n*Почему:*\n{status}\n\n"
                             f"*Куда ставить:*\n• Вход: `{current_price}`\n• Стоп: `{sl:.4f}`\n• Цель 1: `{tp1:.4f}`\n• Цель 2: `{tp2:.4f}`\n\n"
-                            f"*Размер позиции (риск {RISK_PERCENT}%):* ≈ `{size}`\n"
+                            f"*Размер позиции (риск {config['RISK_PERCENT']}%):* ≈ `{size}`\n"
                             f"Риск/Прибыль: 1 к {rr:.1f}\n\n——————————————\n"
                             f"• RSI: {explain_rsi(rsi)}\n• Stochastic: {explain_stoch(stoch_k)}\n"
                             f"• MACD: {explain_macd(macd_hist)}\n• Дивергенция: {explain_divergence(divergence)}\n"
@@ -730,19 +863,16 @@ def process_symbol(symbol, btc_ctx, fng, session_ok):
 # ====================== ГЛАВНЫЙ ЦИКЛ ======================
 def check_markets():
     global last_report_date
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Проверка...")
+    if bot_paused:
+        print("Бот на паузе")
+        return
 
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Проверка...")
     session_name, session_quality, session_ok = get_session_info()
     print(f"Сессия: {session_name} ({session_quality})")
 
-    if not session_ok and STRONG_MODE:
-        print("Сессия слабая + Strong Mode — пропуск")
-        return
-
-    # Обновляем результаты старых сигналов
     update_signal_results()
 
-    # Дневной отчёт (примерно в 21:00 UTC)
     today = datetime.now(timezone.utc).date()
     hour = datetime.now(timezone.utc).hour
     if hour == 21 and last_report_date != today:
@@ -754,7 +884,7 @@ def check_markets():
                 f"Прибыльных: {stats['wins']}\n"
                 f"Убыточных: {stats['losses']}\n"
                 f"Винрейт: {stats['winrate']:.1f}%\n\n"
-                f"Режим: {'Только сильные' if STRONG_MODE else 'Обычный'}"
+                f"Режим: {'Только сильные' if config['STRONG_MODE'] else 'Обычный'}"
             )
             send_telegram(msg)
         last_report_date = today
@@ -762,6 +892,7 @@ def check_markets():
     symbols = get_top_symbols()
     btc_ctx = get_btc_context()
     fng = get_fear_greed()
+    params = get_dynamic_params()
 
     all_candidates = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -775,7 +906,7 @@ def check_markets():
         all_candidates.sort(key=lambda x: x["score"], reverse=True)
         sent = 0
         for cand in all_candidates:
-            if sent >= MAX_SIGNALS_PER_CYCLE:
+            if sent >= params["MAX_SIGNALS_PER_CYCLE"]:
                 break
             if send_signal_message(cand["msg"], cand["symbol"], cand["key"], cand["data"]):
                 sent += 1
@@ -785,8 +916,22 @@ def check_markets():
 
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
-    print("🚀 Бот запущен с полным набором фич")
-    print(f"Депозит: ${ACCOUNT_BALANCE} | Риск: {RISK_PERCENT}% | Strong Mode: {STRONG_MODE}")
+    print("🚀 Бот запущен с управлением через Telegram")
+    print(f"Депозит: ${config['ACCOUNT_BALANCE']} | Риск: {config['RISK_PERCENT']}% | Strong: {config['STRONG_MODE']}")
+    
+    # Запускаем поток обработки команд
+    cmd_thread = threading.Thread(target=command_loop, daemon=True)
+    cmd_thread.start()
+    
+    # Приветственное сообщение
+    send_telegram(
+        "✅ *Бот запущен*\n\n"
+        f"Депозит: `${config['ACCOUNT_BALANCE']:,.0f}`\n"
+        f"Риск: `{config['RISK_PERCENT']}%`\n"
+        f"Режим: `{'Только сильные' if config['STRONG_MODE'] else 'Обычный'}`\n\n"
+        "Напиши `/help` чтобы увидеть все команды"
+    )
+    
     while True:
         try:
             check_markets()
