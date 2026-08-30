@@ -1,10 +1,12 @@
+import os
 import time
 import ccxt
 from telegram import Bot
 
 # --- НАСТРОЙКИ ---
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Токен вашего бота от @BotFather
-CHAT_ID = "YOUR_CHAT_ID"  # Ваш Chat ID
+# Токен и ID можно указать напрямую в кавычках или через переменные окружения
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  
+CHAT_ID = os.getenv("CHAT_ID", "673791974")  
 
 # Список монет для отслеживания
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
