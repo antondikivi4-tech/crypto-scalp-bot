@@ -4,19 +4,19 @@ import ccxt
 from telegram import Bot
 
 # --- НАСТРОЙКИ ---
-# Токен и ID можно указать напрямую в кавычках или через переменные окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  
 CHAT_ID = os.getenv("CHAT_ID", "673791974")  
 
-# Список монет для отслеживания
+# Список монет для отслеживания на Bybit
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-TIMEFRAME = "15m"
+TIMEFRAME = "15"  # У Bybit таймфрейм может передаваться в минутах как строка "15"
 
 # Порог приближения к уровню (в процентах)
 THRESHOLD_PERCENT = 0.2 
 
 bot = Bot(token=TELEGRAM_TOKEN)
-exchange = ccxt.binance()
+# Переключаемся на публичное API биржи Bybit
+exchange = ccxt.bybit()
 
 def get_support_resistance(candles):
     highs = [c[2] for c in candles]
@@ -28,7 +28,7 @@ def get_support_resistance(candles):
     return support, resistance
 
 def check_markets():
-    print("Проверка рынков...")
+    print("Проверка рынков через Bybit...")
     for symbol in SYMBOLS:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=50)
@@ -38,9 +38,9 @@ def check_markets():
             support_diff = abs(current_price - support) / support * 100
             if support_diff <= THRESHOLD_PERCENT:
                 message = (
-                    f"🟢 **СИГНАЛ: ПОДДЕРЖКА**\n"
+                    f"🟢 **СИГНАЛ: ПОДДЕРЖКА (Bybit)**\n"
                     f"Монета: `{symbol}`\n"
-                    f"Таймфрейм: `{TIMEFRAME}`\n"
+                    f"Таймфрейм: `{TIMEFRAME}m`\n"
                     f"Цена: `{current_price}`\n"
                     f"Уровень поддержки: `{support:.4f}`"
                 )
@@ -49,9 +49,9 @@ def check_markets():
             resistance_diff = abs(current_price - resistance) / resistance * 100
             if resistance_diff <= THRESHOLD_PERCENT:
                 message = (
-                    f"🔴 **СИГНАЛ: СОПРОТИВЛЕНИЕ**\n"
+                    f"🔴 **СИГНАЛ: СОПРОТИВЛЕНИЕ (Bybit)**\n"
                     f"Монета: `{symbol}`\n"
-                    f"Таймфрейм: `{TIMEFRAME}`\n"
+                    f"Таймфрейм: `{TIMEFRAME}m`\n"
                     f"Цена: `{current_price}`\n"
                     f"Уровень сопротивления: `{resistance:.4f}`"
                 )
@@ -61,7 +61,7 @@ def check_markets():
             print(f"Ошибка при обработке {symbol}: {e}")
 
 if __name__ == "__main__":
-    print("Бот запущен и следит за уровнями...")
+    print("Бот запущен и следит за уровнями через Bybit...")
     while True:
         check_markets()
         time.sleep(180)
