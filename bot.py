@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import ccxt
 from telegram import Bot
 
@@ -7,15 +8,12 @@ from telegram import Bot
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")  
 CHAT_ID = os.getenv("CHAT_ID", "673791974")  
 
-# Список монет для отслеживания на Bybit
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-TIMEFRAME = "15"  # У Bybit таймфрейм может передаваться в минутах как строка "15"
+TIMEFRAME = "15"
 
-# Порог приближения к уровню (в процентах)
 THRESHOLD_PERCENT = 0.2 
 
 bot = Bot(token=TELEGRAM_TOKEN)
-# Переключаемся на публичное API биржи Bybit
 exchange = ccxt.bybit()
 
 def get_support_resistance(candles):
@@ -26,6 +24,9 @@ def get_support_resistance(candles):
     support = min(lows[:-1])
     
     return support, resistance
+
+async def send_alert(message):
+    await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
 
 def check_markets():
     print("Проверка рынков через Bybit...")
@@ -44,7 +45,7 @@ def check_markets():
                     f"Цена: `{current_price}`\n"
                     f"Уровень поддержки: `{support:.4f}`"
                 )
-                bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+                asyncio.run(send_alert(message))
             
             resistance_diff = abs(current_price - resistance) / resistance * 100
             if resistance_diff <= THRESHOLD_PERCENT:
@@ -55,7 +56,7 @@ def check_markets():
                     f"Цена: `{current_price}`\n"
                     f"Уровень сопротивления: `{resistance:.4f}`"
                 )
-                bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+                asyncio.run(send_alert(message))
                 
         except Exception as e:
             print(f"Ошибка при обработке {symbol}: {e}")
