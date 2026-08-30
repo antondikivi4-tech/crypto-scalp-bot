@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from functools import wraps
 import numpy as np
 
-# ====================== НАСТРОЙКИ ======================
+# ====================== НАСТРОЙКИ (СРЕДНЕЕ УЖЕСТОЧЕНИЕ) ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "673791974")
 
@@ -14,27 +14,34 @@ TIMEFRAME = "15m"
 HIGHER_TF_1H = "1h"
 HIGHER_TF_4H = "4h"
 
-THRESHOLD_PERCENT = 0.25
-IMPULSE_PERCENT = 1.3
+# --- Средние ужесточённые параметры ---
+THRESHOLD_PERCENT = 0.15          # было 0.25
+IMPULSE_PERCENT = 1.7             # было 1.3
 TOP_COINS_LIMIT = 8
-COOLDOWN_TIME = 2700
+COOLDOWN_TIME = 3200              # ~53 минуты
 CACHE_TOP_SECONDS = 300
 MAX_RETRIES = 4
 BACKOFF_BASE = 1.8
 
-RISK_PERCENT = 0.8
-ATR_SL_MULT = 1.4
-ATR_TP1_MULT = 2.0
-ATR_TP2_MULT = 3.5
+ATR_SL_MULT = 1.35
+ATR_TP1_MULT = 2.1
+ATR_TP2_MULT = 3.4
 
-MIN_VOLUME_SPIKE = 1.7
+MIN_VOLUME_SPIKE = 2.1            # было 1.7
 MIN_RISING_VOLUME_BARS = 2
-RSI_OVERSOLD = 38
-RSI_OVERBOUGHT = 62
-STOCH_OVERSOLD = 25
-STOCH_OVERBOUGHT = 75
-MAX_BTC_VOLATILITY_ATR = 2.8
+RSI_OVERSOLD = 33                 # было 38
+RSI_OVERBOUGHT = 67               # было 62
+STOCH_OVERSOLD = 20
+STOCH_OVERBOUGHT = 80
+MAX_BTC_VOLATILITY_ATR = 2.6
 LOW_LIQUIDITY_HOURS_UTC = {0, 1, 2, 3, 4, 5}
+
+# Новые жёсткие фильтры
+REQUIRE_HIGHER_TF_ALIGN = True    # обязательно совпадение со старшим ТФ
+REQUIRE_VOLUME_SPIKE = True       # без всплеска объёма — не отправляем
+MIN_RR_RATIO = 1.6                # минимальный R:R
+STRICT_BTC_FILTER = True
+MAX_SIGNALS_PER_CYCLE = 2         # максимум сигналов за одну проверку
 
 sent_signals = {}
 top_symbols_cache = {"symbols": [], "timestamp": 0}
@@ -344,12 +351,12 @@ def check_liquidations_improved(symbol, support, resistance, current_price):
             elif side == 'sell':
                 longs_liq += amount
 
-        if total_vol < 80000:
+        if total_vol < 120000:  # повысили порог
             return None
 
-        near_level = abs(current_price - support) / support * 100 < 0.6 or abs(current_price - resistance) / resistance * 100 < 0.6
+        near_level = abs(current_price - support) / support * 100 < 0.45 or abs(current_price - resistance) / resistance * 100 < 0.45
 
-        if shorts_liq > longs_liq * 1.3:
+        if shorts_liq > longs_liq * 1.4:
             side_text = "много людей выбило из коротких позиций — цена может продолжить рост"
             preferred = "long"
         else:
@@ -369,7 +376,7 @@ def check_liquidations_improved(symbol, support, resistance, current_price):
 def send_telegram_message(message, symbol, signal_key):
     now = time.time()
     if now - sent_signals.get(signal_key, 0) < COOLDOWN_TIME:
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     clean = symbol.split(':')[0].replace('/', '')
     bybit_url = f"https://www.bybit.com/trade/usdt/{clean}"
@@ -387,10 +394,13 @@ def send_telegram_message(message, symbol, signal_key):
         if r.status_code == 200:
             sent_signals[signal_key] = now
             print(f"✅ Сигнал отправлен: {signal_key}")
+            return True
         else:
             print(f"Telegram error {r.status_code}: {r.text[:200]}")
+            return False
     except Exception as e:
         print(f"Ошибка Telegram: {e}")
+        return False
 
 def build_sl_tp(current_price, atr, direction):
     if direction == "long":
@@ -433,13 +443,13 @@ def explain_stoch(k):
 
 def explain_macd(hist):
     if hist > 0.001:
-        return f"положительный и растущий — сила у покупателей"
+        return "положительный и растущий — сила у покупателей"
     if hist > 0:
-        return f"слабо положительный — покупатели немного сильнее"
+        return "слабо положительный — покупатели немного сильнее"
     if hist < -0.001:
-        return f"отрицательный и падающий — сила у продавцов"
+        return "отрицательный и падающий — сила у продавцов"
     if hist < 0:
-        return f"слабо отрицательный — продавцы немного сильнее"
+        return "слабо отрицательный — продавцы немного сильнее"
     return "около нуля — нет явного преимущества"
 
 def explain_divergence(div):
@@ -494,6 +504,8 @@ def check_markets():
     if btc_ctx["extreme_vol"]:
         print(f"⚠️ Экстремальная волатильность BTC — фильтруем слабые сигналы")
 
+    candidates = []  # сюда собираем все потенциальные сигналы
+
     for symbol in symbols:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=80)
@@ -527,85 +539,107 @@ def check_markets():
 
             # ========== 0. ЛИКВИДАЦИИ ==========
             liq = check_liquidations_improved(symbol, support, resistance, current_price)
-            if liq and (liq["near_level"] or liq["volume"] > 250000):
+            if liq and (liq["near_level"] or liq["volume"] > 300000):
                 direction = "long" if liq["preferred"] == "long" else "short"
-                if not ((direction == "long" and btc_ctx["trend"] == "медвежий" and btc_ctx["extreme_vol"]) or
-                        (direction == "short" and btc_ctx["trend"] == "бычий" and btc_ctx["extreme_vol"])):
-                    sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
-                    action = "ПОКУПАТЬ (ЛОНГ)" if direction == "long" else "ПРОДАВАТЬ (ШОРТ)"
-                    msg = (
-                        f"💥 *РЕЗКОЕ ДВИЖЕНИЕ ИЗ-ЗА ЛИКВИДАЦИЙ*\n\n"
-                        f"Монета: `{clean_name}`\n"
-                        f"Текущая цена: `{current_price}`\n\n"
-                        f"*Что делать:* {action}\n\n"
-                        f"*Почему сигнал появился:*\n{liq['text']}\n\n"
-                        f"*Куда ставить ордера:*\n"
-                        f"• Вход: около `{current_price}`\n"
-                        f"• Стоп-лосс (защита): `{sl:.4f}`\n"
-                        f"• Цель 1: `{tp1:.4f}`\n"
-                        f"• Цель 2: `{tp2:.4f}`\n\n"
-                        f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
-                        f"——————————————\n"
-                        f"*Что показывают индикаторы:*\n\n"
-                        f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
-                        f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
-                        f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
-                        f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
-                        f"• Направление на 1 часе: {bias_1h}\n"
-                        f"• Плата за перенос позиции: {explain_funding(funding)}\n"
-                        f"• Настроение рынка: {explain_fng(fng)}\n"
-                        f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
-                    )
-                    send_telegram_message(msg, symbol, f"{symbol}_liq")
+                
+                # Фильтры
+                if STRICT_BTC_FILTER:
+                    if (direction == "long" and btc_ctx["trend"] == "медвежий") or (direction == "short" and btc_ctx["trend"] == "бычий"):
+                        continue
+                if REQUIRE_HIGHER_TF_ALIGN:
+                    if (direction == "long" and "медвежье" in bias_1h) or (direction == "short" and "бычье" in bias_1h):
+                        continue
+
+                sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
+                if rr < MIN_RR_RATIO:
+                    continue
+
+                action = "ПОКУПАТЬ (ЛОНГ)" if direction == "long" else "ПРОДАВАТЬ (ШОРТ)"
+                msg = (
+                    f"💥 *РЕЗКОЕ ДВИЖЕНИЕ ИЗ-ЗА ЛИКВИДАЦИЙ*\n\n"
+                    f"Монета: `{clean_name}`\n"
+                    f"Текущая цена: `{current_price}`\n\n"
+                    f"*Что делать:* {action}\n\n"
+                    f"*Почему сигнал появился:*\n{liq['text']}\n\n"
+                    f"*Куда ставить ордера:*\n"
+                    f"• Вход: около `{current_price}`\n"
+                    f"• Стоп-лосс (защита): `{sl:.4f}`\n"
+                    f"• Цель 1: `{tp1:.4f}`\n"
+                    f"• Цель 2: `{tp2:.4f}`\n\n"
+                    f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
+                    f"——————————————\n"
+                    f"*Что показывают индикаторы:*\n\n"
+                    f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
+                    f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
+                    f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
+                    f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
+                    f"• Направление на 1 часе: {bias_1h}\n"
+                    f"• Плата за перенос позиции: {explain_funding(funding)}\n"
+                    f"• Настроение рынка: {explain_fng(fng)}\n"
+                    f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
+                )
+                score = 80 + (10 if liq["near_level"] else 0) + (5 if is_volume_spike else 0)
+                candidates.append({"score": score, "msg": msg, "symbol": symbol, "key": f"{symbol}_liq"})
 
             # ========== 1. ИМПУЛЬС ==========
             candle_change = ((current_price - open_p) / open_p) * 100
-            strong_body = abs(current_price - open_p) / (last[2] - last[3] + 1e-9) > 0.65
+            strong_body = abs(current_price - open_p) / (last[2] - last[3] + 1e-9) > 0.68
             if abs(candle_change) >= IMPULSE_PERCENT and is_volume_spike and rising_volume and strong_body:
                 direction = "long" if candle_change > 0 else "short"
-                if btc_ctx["extreme_vol"] and abs(candle_change) < 2.2:
+
+                if btc_ctx["extreme_vol"] and abs(candle_change) < 2.3:
                     continue
-                if (direction == "long" and "медвежье" in bias_1h) or (direction == "short" and "бычье" in bias_1h):
-                    continue
+                if REQUIRE_HIGHER_TF_ALIGN:
+                    if (direction == "long" and "медвежье" in bias_1h) or (direction == "short" and "бычье" in bias_1h):
+                        continue
+                if STRICT_BTC_FILTER:
+                    if (direction == "long" and btc_ctx["trend"] == "медвежий") or (direction == "short" and btc_ctx["trend"] == "бычий"):
+                        continue
 
                 macd_ok = (macd_hist > 0 and direction == "long") or (macd_hist < 0 and direction == "short")
-                stoch_ok = (stoch_k < 80 and direction == "long") or (stoch_k > 20 and direction == "short")
+                stoch_ok = (stoch_k < 78 and direction == "long") or (stoch_k > 22 and direction == "short")
 
-                if macd_ok or stoch_ok:
-                    sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
-                    if direction == "long":
-                        title = "🚀 СИЛЬНЫЙ РОСТ"
-                        action = "ПОКУПАТЬ (ЛОНГ)"
-                        reason = "цена резко выросла на очень большом объёме — это признак сильного интереса покупателей"
-                    else:
-                        title = "⚡️ СИЛЬНОЕ ПАДЕНИЕ"
-                        action = "ПРОДАВАТЬ (ШОРТ)"
-                        reason = "цена резко упала на очень большом объёме — это признак сильного интереса продавцов"
+                if not (macd_ok or stoch_ok):
+                    continue
 
-                    msg = (
-                        f"*{title}*\n\n"
-                        f"Монета: `{clean_name}`\n"
-                        f"Текущая цена: `{current_price}`\n\n"
-                        f"*Что делать:* {action}\n\n"
-                        f"*Почему сигнал появился:*\n{reason}\n\n"
-                        f"*Куда ставить ордера:*\n"
-                        f"• Вход: около `{current_price}`\n"
-                        f"• Стоп-лосс (защита): `{sl:.4f}`\n"
-                        f"• Цель 1: `{tp1:.4f}`\n"
-                        f"• Цель 2: `{tp2:.4f}`\n\n"
-                        f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
-                        f"——————————————\n"
-                        f"*Что показывают индикаторы:*\n\n"
-                        f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
-                        f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
-                        f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
-                        f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
-                        f"• Направление на 1 часе: {bias_1h}\n"
-                        f"• Плата за перенос позиции: {explain_funding(funding)}\n"
-                        f"• Настроение рынка: {explain_fng(fng)}\n"
-                        f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
-                    )
-                    send_telegram_message(msg, symbol, f"{symbol}_impulse")
+                sl, tp1, tp2, rr = build_sl_tp(current_price, atr, direction)
+                if rr < MIN_RR_RATIO:
+                    continue
+
+                if direction == "long":
+                    title = "🚀 СИЛЬНЫЙ РОСТ"
+                    action = "ПОКУПАТЬ (ЛОНГ)"
+                    reason = "цена резко выросла на очень большом объёме — это признак сильного интереса покупателей"
+                else:
+                    title = "⚡️ СИЛЬНОЕ ПАДЕНИЕ"
+                    action = "ПРОДАВАТЬ (ШОРТ)"
+                    reason = "цена резко упала на очень большом объёме — это признак сильного интереса продавцов"
+
+                msg = (
+                    f"*{title}*\n\n"
+                    f"Монета: `{clean_name}`\n"
+                    f"Текущая цена: `{current_price}`\n\n"
+                    f"*Что делать:* {action}\n\n"
+                    f"*Почему сигнал появился:*\n{reason}\n\n"
+                    f"*Куда ставить ордера:*\n"
+                    f"• Вход: около `{current_price}`\n"
+                    f"• Стоп-лосс (защита): `{sl:.4f}`\n"
+                    f"• Цель 1: `{tp1:.4f}`\n"
+                    f"• Цель 2: `{tp2:.4f}`\n\n"
+                    f"Соотношение риска к прибыли: примерно 1 к {rr:.1f}\n\n"
+                    f"——————————————\n"
+                    f"*Что показывают индикаторы:*\n\n"
+                    f"• Сила тренда (RSI): {explain_rsi(rsi)}\n"
+                    f"• Момент разворота (Stochastic): {explain_stoch(stoch_k)}\n"
+                    f"• Сила движения (MACD): {explain_macd(macd_hist)}\n"
+                    f"• Расхождение цены и силы: {explain_divergence(divergence)}\n"
+                    f"• Направление на 1 часе: {bias_1h}\n"
+                    f"• Плата за перенос позиции: {explain_funding(funding)}\n"
+                    f"• Настроение рынка: {explain_fng(fng)}\n"
+                    f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
+                )
+                score = 70 + min(abs(candle_change) * 3, 20) + (10 if is_volume_spike else 0)
+                candidates.append({"score": score, "msg": msg, "symbol": symbol, "key": f"{symbol}_impulse"})
 
             # ========== 2. ПОДДЕРЖКА (ЛОНГ) ==========
             support_diff = abs(current_price - support) / support * 100
@@ -613,20 +647,23 @@ def check_markets():
                 is_bounce = (prev[4] < prev[1]) and (current_price > open_p)
                 rsi_ok = rsi < RSI_OVERSOLD or divergence == "bullish"
                 stoch_ok = stoch_k < STOCH_OVERSOLD
-                volume_ok = is_volume_spike or rising_volume
+                volume_ok = is_volume_spike if REQUIRE_VOLUME_SPIKE else (is_volume_spike or rising_volume)
 
-                if "медвежье" in bias_1h and btc_ctx["trend"] == "медвежий":
-                    status = "цена подошла к уровню поддержки, но старший таймфрейм против — лучше подождать подтверждения"
-                    strong = False
-                elif is_bounce and (rsi_ok or stoch_ok) and volume_ok:
-                    status = "цена подошла к сильному уровню поддержки и отскочила вверх на объёме"
-                    strong = True
-                else:
-                    status = "цена подошла к уровню поддержки — ждём более чёткий отскок"
-                    strong = False
+                if REQUIRE_HIGHER_TF_ALIGN and "медвежье" in bias_1h:
+                    continue
+                if STRICT_BTC_FILTER and btc_ctx["trend"] == "медвежий":
+                    continue
 
-                if strong or support_diff < 0.12:
+                strong = is_bounce and (rsi_ok or stoch_ok) and volume_ok
+
+                if strong or support_diff < 0.09:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, "long")
+                    if rr < MIN_RR_RATIO:
+                        continue
+
+                    status = "цена подошла к сильному уровню поддержки и отскочила вверх на объёме" if strong else \
+                             "цена очень близко к сильному уровню поддержки"
+
                     msg = (
                         f"🟢 *ХОРОШАЯ ТОЧКА ДЛЯ ПОКУПКИ*\n\n"
                         f"Монета: `{clean_name}`\n"
@@ -650,7 +687,8 @@ def check_markets():
                         f"• Настроение рынка: {explain_fng(fng)}\n"
                         f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
                     )
-                    send_telegram_message(msg, symbol, f"{symbol}_support")
+                    score = 65 + (15 if strong else 0) + (10 if support_diff < 0.08 else 0)
+                    candidates.append({"score": score, "msg": msg, "symbol": symbol, "key": f"{symbol}_support"})
 
             # ========== 3. СОПРОТИВЛЕНИЕ (ШОРТ) ==========
             resist_diff = abs(current_price - resistance) / resistance * 100
@@ -658,20 +696,23 @@ def check_markets():
                 is_reject = (prev[4] > prev[1]) and (current_price < open_p)
                 rsi_ok = rsi > RSI_OVERBOUGHT or divergence == "bearish"
                 stoch_ok = stoch_k > STOCH_OVERBOUGHT
-                volume_ok = is_volume_spike or rising_volume
+                volume_ok = is_volume_spike if REQUIRE_VOLUME_SPIKE else (is_volume_spike or rising_volume)
 
-                if "бычье" in bias_1h and btc_ctx["trend"] == "бычий":
-                    status = "цена подошла к уровню сопротивления, но старший таймфрейм против — лучше подождать"
-                    strong = False
-                elif is_reject and (rsi_ok or stoch_ok) and volume_ok:
-                    status = "цена подошла к сильному уровню сопротивления и отбилась вниз на объёме"
-                    strong = True
-                else:
-                    status = "цена подошла к уровню сопротивления — ждём более чёткий отбой"
-                    strong = False
+                if REQUIRE_HIGHER_TF_ALIGN and "бычье" in bias_1h:
+                    continue
+                if STRICT_BTC_FILTER and btc_ctx["trend"] == "бычий":
+                    continue
 
-                if strong or resist_diff < 0.12:
+                strong = is_reject and (rsi_ok or stoch_ok) and volume_ok
+
+                if strong or resist_diff < 0.09:
                     sl, tp1, tp2, rr = build_sl_tp(current_price, atr, "short")
+                    if rr < MIN_RR_RATIO:
+                        continue
+
+                    status = "цена подошла к сильному уровню сопротивления и отбилась вниз на объёме" if strong else \
+                             "цена очень близко к сильному уровню сопротивления"
+
                     msg = (
                         f"🔴 *ХОРОШАЯ ТОЧКА ДЛЯ ПРОДАЖИ*\n\n"
                         f"Монета: `{clean_name}`\n"
@@ -695,14 +736,28 @@ def check_markets():
                         f"• Настроение рынка: {explain_fng(fng)}\n"
                         f"• Объём торгов: {explain_volume(is_volume_spike, rising_volume)}"
                     )
-                    send_telegram_message(msg, symbol, f"{symbol}_resistance")
+                    score = 65 + (15 if strong else 0) + (10 if resist_diff < 0.08 else 0)
+                    candidates.append({"score": score, "msg": msg, "symbol": symbol, "key": f"{symbol}_resistance"})
 
         except Exception as e:
             print(f"Ошибка обработки {symbol}: {e}")
 
+    # ===== Отправляем только лучшие сигналы (максимум 2) =====
+    if candidates:
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        sent_count = 0
+        for cand in candidates:
+            if sent_count >= MAX_SIGNALS_PER_CYCLE:
+                break
+            if send_telegram_message(cand["msg"], cand["symbol"], cand["key"]):
+                sent_count += 1
+        print(f"Отправлено сигналов в этом цикле: {sent_count}")
+    else:
+        print("Подходящих сигналов не найдено")
+
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
-    print("🚀 Бот запущен (простые и понятные сообщения для новичка)")
+    print("🚀 Бот запущен (среднее ужесточение + макс. 2 сигнала за цикл)")
     print("Режим: только сигналы. Реальную торговлю веди вручную!")
     while True:
         try:
