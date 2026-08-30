@@ -12,13 +12,12 @@ THRESHOLD_PERCENT = 0.15
 IMPULSE_PERCENT = 1.5
 TOP_COINS_LIMIT = 6
 
-# Словарь для защиты от спама (кулдаун 1 час)
 sent_signals = {}
 COOLDOWN_TIME = 3600  
 
 exchange = ccxt.bybit({
     'options': {
-        'defaultType': 'linear',  # Переключаемся на фьючерсы (ликвидации есть только там)
+        'defaultType': 'linear',
     }
 })
 
@@ -103,7 +102,7 @@ def check_liquidations(symbol):
         longs_liquidated = 0
         shorts_liquidated = 0
         
-        current_time = time.time() * 1000  # переводим в миллисекунды
+        current_time = time.time() * 1000
         for liq in liquidations:
             if current_time - liq.get('timestamp', 0) <= 900000:
                 amount = liq.get('usdValue', 0) or (liq.get('amount', 0) * liq.get('price', 0))
@@ -114,7 +113,10 @@ def check_liquidations(symbol):
                     longs_liquidated += amount
                     
         if recent_liq_volume >= 100000:
-            side_text = "🟢 Сбриты Шорты (Каскад роста)" if shorts_liquidated > longs_liquidated else "🔴 Сбриты Лонги (Каскад падения)"
+            if shorts_liquidated > longs_liquidated:
+                side_text = "🟢 Сбриты Шорты (Импульс вверх ➔ Поиск ЛОНГА по тренду)"
+            else:
+                side_text = "🔴 Сбриты Лонги (Импульс вниз ➔ Поиск ШОРТА по тренду)"
             return {
                 "text": side_text,
                 "volume": recent_liq_volume
@@ -124,7 +126,7 @@ def check_liquidations(symbol):
     return None
 
 def check_markets():
-    print("Проверка рынков (Топ объем + RSI + Объемы + Уровни + Ликвидации)...")
+    print("Проверка рынков с четким указанием направления ЛОНГ / ШОРТ...")
     symbols = get_top_symbols(TOP_COINS_LIMIT)
     
     for symbol in symbols:
@@ -149,13 +151,13 @@ def check_markets():
             rsi = calculate_rsi(closes)
             support, resistance = get_support_resistance(ohlcv)
             
-            # 0. Проверка ликвидаций
+            # 0. Ликвидации
             liq_data = check_liquidations(symbol)
             if liq_data:
                 liq_msg = (
                     f"💥 *КАСКАД ЛИКВИДАЦИЙ*\n"
                     f"Монета: `{symbol.split(':')[0]}`\n"
-                    f"Тип: *{liq_data['text']}*\n"
+                    f"{liq_data['text']}\n"
                     f"Объем ликвидаций: `${liq_data['volume']:,.0f}`\n"
                     f"Цена сейчас: `{current_price}`"
                 )
@@ -165,9 +167,11 @@ def check_markets():
             # 1. Импульс
             candle_change = ((current_price - open_price) / open_price) * 100
             if abs(candle_change) >= IMPULSE_PERCENT and is_volume_spike:
+                action_dir = "🟢 ИЩЕМ ЛОНГ (Покупка по импульсу)" if candle_change > 0 else "🔴 ИЩЕМ ШОРТ (Продажа по импульсу)"
                 direction_text = "🚀 МОЩНЫЙ ИМПУЛЬС РОСТА" if candle_change > 0 else "⚡️ МОЩНЫЙ ИМПУЛЬС ПАДЕНИЯ"
                 impulse_msg = (
                     f"📊 *{direction_text}*\n"
+                    f"🎯 Направление: *{action_dir}*\n"
                     f"Монета: `{symbol.split(':')[0]}`\n"
                     f"Изменение свечи: `{candle_change:.2f}%`\n"
                     f"Всплеск объема: `x{(last_volume/avg_volume):.1f} от нормы` ✅\n"
@@ -177,16 +181,17 @@ def check_markets():
                 signal_key = f"{symbol}_impulse"
                 send_telegram_message(impulse_msg, symbol, signal_key)
 
-            # 2. Поддержка
+            # 2. Поддержка (ЛОНГ)
             support_diff = abs(current_price - support) / support * 100
             if support_diff <= THRESHOLD_PERCENT:
                 is_safe_bounce = (prev_candle[4] < prev_candle[1]) and (current_price > open_price)
                 rsi_filter = rsi < 40
                 
-                status_desc = "🛡 *Отличная точка (RSI внизу + отскок)*" if (is_safe_bounce and rsi_filter) else "⚠️ *Подход к уровню*"
+                status_desc = "🛡 *Отличная точка для ЛОНГА (RSI внизу + отскок)*" if (is_safe_bounce and rsi_filter) else "⚠️ *Подход к поддержке (ждем паттерн)*"
                 
                 message = (
-                    f"🟢 *СИГНАЛ: ПОДДЕРЖКА (Bybit)*\n"
+                    f"🟢 *СИГНАЛ: УРОВЕНЬ ПОДДЕРЖКИ*\n"
+                    f"🎯 Рекомендация: *ОТКРЫВАТЬ ЛОНГ 🟢*\n"
                     f"Статус: {status_desc}\n"
                     f"Монета: `{symbol.split(':')[0]}`\n"
                     f"Цена: `{current_price}`\n"
@@ -197,16 +202,17 @@ def check_markets():
                 signal_key = f"{symbol}_support"
                 send_telegram_message(message, symbol, signal_key)
             
-            # 3. Сопротивление
+            # 3. Сопротивление (ШОРТ)
             resistance_diff = abs(current_price - resistance) / resistance * 100
             if resistance_diff <= THRESHOLD_PERCENT:
                 is_safe_rejection = (prev_candle[4] > prev_candle[1]) and (current_price < open_price)
                 rsi_filter = rsi > 60
                 
-                status_desc = "🛡 *Отличная точка (RSI вверху + отскок)*" if (is_safe_rejection and rsi_filter) else "⚠️ *Подход к уровню*"
+                status_desc = "🛡 *Отличная точка для ШОРТА (RSI вверху + отскок)*" if (is_safe_rejection and rsi_filter) else "⚠️ *Подход к сопротивлению (ждем паттерн)*"
                 
                 message = (
-                    f"🔴 *СИГНАЛ: СОПРОТИВЛЕНИЕ (Bybit)*\n"
+                    f"🔴 *СИГНАЛ: УРОВЕНЬ СОПРОТИВЛЕНИЯ*\n"
+                    f"🎯 Рекомендация: *ОТКРЫВАТЬ ШОРТ 🔴*\n"
                     f"Статус: {status_desc}\n"
                     f"Монета: `{symbol.split(':')[0]}`\n"
                     f"Цена: `{current_price}`\n"
@@ -221,7 +227,7 @@ def check_markets():
             print(f"Ошибка при обработке {symbol}: {e}")
 
 if __name__ == "__main__":
-    print("Супер-бот запущен с мониторингом ликвидаций на фьючерсах...")
+    print("Супер-бот запущен с явными указаниями ЛОНГ / ШОРТ...")
     while True:
         check_markets()
         time.sleep(180)
